@@ -1,0 +1,15 @@
+{
+  "name": "figma-elementor-agent-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node helpers for the Figma → Elementor agent (visual diff, etc.)",
+  "scripts": {
+    "compare": "node pixelmatch_compare.js"
+  },
+  "dependencies": {
+    "pixelmatch": "^5.3.0",
+    "playwright": "^1.45.0",
+    "pngjs": "^7.0.0",
+    "sharp": "^0.33.4"
+  }
+}

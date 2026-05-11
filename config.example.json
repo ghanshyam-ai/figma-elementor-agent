@@ -1,0 +1,6 @@
+{
+  "wp_url": "http://localhost:10048",
+  "wp_user": "admin",
+  "wp_password": "your-wp-admin-password",
+  "theme_slug": "hello-elementor"
+}

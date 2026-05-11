@@ -1,0 +1,148 @@
+"""
+Persistent project state — survives `build/` wipes between page imports.
+
+The project workflow is intentionally page-by-page (start with the home
+page so header / footer / globals get created once, then run the agent
+per page after that). To keep the second + third + Nth runs fast and
+non-destructive, we cache:
+
+    • kit_applied + kit_id            — globals were already written
+    • template_ids_by_slug            — header / footer / popup / section
+                                        templates created on prior runs
+    • form_ids_by_title               — Gravity Forms we've already created
+    • asset_map_by_filename           — media library entries (so re-uploads
+                                        are skipped when the same image is
+                                        referenced from a second page's ZIP)
+    • pages_imported                  — slug → page_id audit trail
+
+Shape: `<repo_root>/project-state.json`. Gitignored (mode 600).
+This file is the orchestrator's "what's already on the WP site". It
+complements `build/state.json`, which is per-run scratch space.
+"""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+_DEFAULT_FILENAME = "project-state.json"
+
+
+@dataclass
+class ProjectState:
+    path: Path
+    first_run_at: str | None = None
+    last_run_at: str | None = None
+    kit_applied: bool = False
+    kit_id: int | None = None
+    template_ids_by_slug: dict[str, dict] = field(default_factory=dict)
+    form_ids_by_title: dict[str, int] = field(default_factory=dict)
+    asset_map_by_filename: dict[str, dict] = field(default_factory=dict)
+    pages_imported: list[dict] = field(default_factory=list)
+
+    # ---- Convenience properties --------------------------------------
+
+    @property
+    def is_first_run(self) -> bool:
+        """True until the kit has been applied AND a header/footer template exists."""
+        if not self.kit_applied:
+            return True
+        kinds = {meta.get("template_type") for meta in self.template_ids_by_slug.values()}
+        return not (kinds & {"header", "footer"})
+
+    @property
+    def header_template(self) -> dict | None:
+        return self._first_template_of("header")
+
+    @property
+    def footer_template(self) -> dict | None:
+        return self._first_template_of("footer")
+
+    def _first_template_of(self, kind: str) -> dict | None:
+        for slug, meta in self.template_ids_by_slug.items():
+            if meta.get("template_type") == kind:
+                return {"slug": slug, **meta}
+        return None
+
+    # ---- Mutators ----------------------------------------------------
+
+    def record_kit_applied(self, kit_id: int) -> None:
+        self.kit_applied = True
+        self.kit_id = kit_id
+
+    def record_template(self, slug: str, template_type: str, template_id: int, title: str = "") -> None:
+        self.template_ids_by_slug[slug] = {
+            "id": template_id,
+            "template_type": template_type,
+            "title": title,
+            "saved_at": _now_iso(),
+        }
+
+    def record_form(self, title: str, form_id: int) -> None:
+        self.form_ids_by_title[title] = form_id
+
+    def record_assets(self, asset_map: dict[str, dict]) -> None:
+        for fname, meta in (asset_map or {}).items():
+            if isinstance(meta, dict) and meta.get("id") and meta.get("url"):
+                self.asset_map_by_filename[fname] = {"id": meta["id"], "url": meta["url"]}
+
+    def record_page(self, slug: str, page_id: int, permalink: str) -> None:
+        self.pages_imported = [p for p in self.pages_imported if p.get("slug") != slug]
+        self.pages_imported.append({
+            "slug": slug,
+            "page_id": page_id,
+            "permalink": permalink,
+            "imported_at": _now_iso(),
+        })
+
+    def remember_run(self) -> None:
+        if not self.first_run_at:
+            self.first_run_at = _now_iso()
+        self.last_run_at = _now_iso()
+
+    # ---- Persistence -------------------------------------------------
+
+    def save(self) -> None:
+        payload = {
+            "first_run_at": self.first_run_at,
+            "last_run_at": self.last_run_at,
+            "kit_applied": self.kit_applied,
+            "kit_id": self.kit_id,
+            "template_ids_by_slug": self.template_ids_by_slug,
+            "form_ids_by_title": self.form_ids_by_title,
+            "asset_map_by_filename": self.asset_map_by_filename,
+            "pages_imported": self.pages_imported,
+        }
+        self.path.write_text(json.dumps(payload, indent=2, default=str))
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+
+def load_state(repo_root: Path, filename: str = _DEFAULT_FILENAME) -> ProjectState:
+    """Load `<repo_root>/project-state.json`, or return a fresh state."""
+    p = repo_root / filename
+    if not p.exists():
+        return ProjectState(path=p)
+    try:
+        raw = json.loads(p.read_text())
+    except json.JSONDecodeError:
+        return ProjectState(path=p)
+    s = ProjectState(path=p)
+    s.first_run_at = raw.get("first_run_at")
+    s.last_run_at = raw.get("last_run_at")
+    s.kit_applied = bool(raw.get("kit_applied"))
+    s.kit_id = raw.get("kit_id")
+    s.template_ids_by_slug = raw.get("template_ids_by_slug") or {}
+    s.form_ids_by_title = raw.get("form_ids_by_title") or {}
+    s.asset_map_by_filename = raw.get("asset_map_by_filename") or {}
+    s.pages_imported = raw.get("pages_imported") or []
+    return s
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")

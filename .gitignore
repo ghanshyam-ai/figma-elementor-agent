@@ -1,0 +1,16 @@
+config.json
+project-config.json
+project-state.json
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+.DS_Store
+*.zip
+.coverage
+htmlcov/
+.claude/agents/
+.claude/skills/
