@@ -12,72 +12,281 @@ plugin signals are inputs to a hybrid pipeline where the agent's own
 detectors, structural analysis, and (when needed) Claude sub-Agent calls
 make the final classification.
 
-## Quick start (3 steps, zero scripts)
+## Prerequisites (one time per machine)
 
-1. Drop the agent folder + Figma export ZIP into your WordPress root:
+Install these on the host machine before setup. The agent's bootstrap takes
+care of *project-local* dependencies (Python venv, npm packages, the WP
+mu-plugin) — it can't install global runtimes.
 
-   ```
-   <wp-root>/
-   ├── wp-config.php
-   ├── wp-content/
-   ├── figma-elementor-agent/         ← this repo
-   └── your-design.zip                ← Figma plugin export
-   ```
+| Tool | Purpose | macOS | Windows |
+|------|---------|-------|---------|
+| Python 3.10–3.13 | runs import + diff pipeline | preinstalled, or `brew install python@3.12` | [python.org installer](https://www.python.org/downloads/) (tick **Add Python to PATH**), or `winget install Python.Python.3.12` |
+| Node 18+ | Playwright + Claude Code | `brew install node` | [nodejs.org LTS](https://nodejs.org), or `winget install OpenJS.NodeJS.LTS` |
+| Claude Code CLI | runs the agent | `npm install -g @anthropic-ai/claude-code` | same, in PowerShell |
+| Local WordPress | the target site | [LocalWP](https://localwp.com) | LocalWP, XAMPP, or WSL2 |
+| Git (optional) | clone this repo | preinstalled / `brew install git` | [git-scm.com](https://git-scm.com/download/win) |
 
-   LocalWP works too — drop them next to `app/`, `conf/`, `logs/`. The
-   agent searches up + into `app/public/`, `public/`, `public_html/`,
-   `wordpress/`, `htdocs/`, `wp/`, `www/`.
+> **Python 3.14 note** — its cookie-handling changes break older `requests`.
+> If you already have 3.14, either upgrade requests
+> (`.venv/bin/pip install --upgrade 'requests>=2.32.3'`) or build the venv
+> against Python 3.12 / 3.13.
 
-2. Inside `figma-elementor-agent/`, copy `config.example.json` →
-   `config.json` and fill in **four fields**:
-
-   ```json
-   {
-     "wp_url": "http://localhost:10048",
-     "wp_user": "admin",
-     "wp_password": "your-wp-admin-password",
-     "theme_slug": "hello-elementor"
-   }
-   ```
-
-3. Symlink agents + skills into `.claude/` so Claude Code registers them,
-   then run `claude` and type `start`:
-
-   ```bash
-   mkdir -p .claude
-   ln -sfn ../agents .claude/agents
-   ln -sfn ../skills .claude/skills
-   claude
-   ```
-
-   Then in the Claude Code prompt:
-
-   ```
-   start
-   ```
-
-   …or with a free-form instruction:
-
-   ```
-   start build the home page only
-   ```
-
-## Page-by-page workflow
-
-The agent processes **one page per run**. The first run builds the home
-page, which establishes globals + header + footer. Each subsequent page
-auto-detects that prior state and skips kit / theme-builder phases:
+Verify everything is on PATH:
 
 ```bash
-# First run — home page (kit + header + footer + page)
-start
-
-# Second + Nth pages — drop a new ZIP, run again
-.venv/bin/python scripts/import_elementor.py --page-only --page-slug about
+# macOS / Linux
+python3 --version    # 3.10–3.13
+node --version       # 18+
+claude --version
 ```
 
-The `--page-only` flag is **optional** — if `project-state.json` shows a
-prior successful run, the orchestrator auto-skips globals/header/footer.
+```powershell
+# Windows (PowerShell)
+python --version
+node --version
+claude --version
+```
+
+## Setup — macOS
+
+Assumes LocalWP. MAMP / Valet / Docker work too — the bootstrap finds
+`wp-config.php` by walking ancestors of the agent folder.
+
+### 1. Create + configure the WordPress site
+
+1. **LocalWP → Create a new site → Custom**. PHP 8.1+, MySQL, finish. Note
+   the admin username and password — they go into `config.json`.
+2. Open the site → **WP Admin** → install + activate **Elementor**.
+   Elementor Pro is recommended (Theme Builder header/footer auto-applies,
+   popups, nav-menu widget). Install **Gravity Forms** only if your Figma
+   export contains forms.
+3. Use a theme that supports `menu-1` / `menu-2` locations. **Hello Elementor**
+   does — it's the default for this agent.
+4. **Settings → Permalinks → Post name**. The bridge REST endpoints 404 on
+   "Plain" — this is the #1 setup error.
+
+### 2. Place the agent folder + Figma ZIP
+
+Two layouts work — the agent finds WordPress either way.
+
+**At the LocalWP site root** (recommended; cleaner):
+```
+~/Local Sites/<site-name>/
+├── app/public/                ← WordPress (wp-config.php lives here)
+├── conf/
+├── logs/
+├── figma-elementor-agent/     ← this repo
+└── your-design.zip            ← Figma plugin export
+```
+
+**Inside the WP root** (also fine):
+```
+~/Local Sites/<site-name>/app/public/
+├── wp-config.php
+├── wp-content/
+├── figma-elementor-agent/
+└── your-design.zip
+```
+
+> ⚠️ **Do NOT rename the agent folder to `.claude`.** `.claude/` is reserved
+> for Claude Code's per-project config — renaming hides the folder and
+> breaks bootstrap. Use any non-dot name.
+
+### 3. Fill in `config.json`
+
+```bash
+cd ~/Local\ Sites/<site-name>/figma-elementor-agent
+cp config.example.json config.json
+open -e config.json    # or use your editor of choice
+```
+
+```json
+{
+  "wp_url": "http://<site-name>.local",
+  "wp_user": "admin",
+  "wp_password": "<password you set in LocalWP>",
+  "theme_slug": "hello-elementor"
+}
+```
+
+`wp_url` must match what WP thinks its site URL is (WP Admin → Settings →
+General). Quick check:
+
+```bash
+curl -I http://<site-name>.local
+```
+
+Should return `HTTP/1.1 200` or `301`.
+
+### 4. Register agents + skills with Claude Code
+
+Claude Code reads agent/skill definitions from `.claude/agents/` and
+`.claude/skills/`. Symlink the project ones in:
+
+```bash
+cd ~/Local\ Sites/<site-name>/figma-elementor-agent
+mkdir -p .claude
+ln -sfn ../agents .claude/agents
+ln -sfn ../skills .claude/skills
+```
+
+### 5. Run
+
+```bash
+claude
+```
+
+In the Claude prompt:
+```
+start
+```
+
+On the first run, the orchestrator will:
+1. Detect `wp_root` by walking up looking for `wp-config.php`.
+2. Copy `figma-importer-bridge.php` → `<wp-root>/wp-content/mu-plugins/`.
+3. Create `.venv/` and `pip install requests Pillow`.
+4. Run `npm install` inside `scripts/`.
+5. Write `project-config.json` (mode 600).
+6. Verify the bridge via `/wp-json/figma-importer/v1/health`.
+7. Pause with "Proceed? [Y/n]" before any WP writes.
+
+If visual review (Phase J) errors with *"Executable doesn't exist"*, the
+Playwright browser binary needs a one-time download:
+```bash
+cd scripts && npx playwright install chromium
+```
+
+## Setup — Windows
+
+Use **PowerShell** (not the legacy Command Prompt). Open it as a regular user.
+
+### 1. Create + configure the WordPress site
+
+Identical to macOS step 1 using LocalWP for Windows. The site root will be:
+```
+%USERPROFILE%\Local Sites\<site-name>\app\public\
+```
+
+Set permalinks to **Post name**. Install Elementor (+ Pro if licensed) and
+optionally Gravity Forms.
+
+### 2. Place the agent folder + Figma ZIP
+
+```
+%USERPROFILE%\Local Sites\<site-name>\
+├── app\public\                ← WordPress
+├── conf\
+├── logs\
+├── figma-elementor-agent\     ← this repo
+└── your-design.zip            ← Figma plugin export
+```
+
+> ⚠️ Do **not** rename the agent folder to `.claude` (same warning as macOS).
+
+### 3. Fill in `config.json`
+
+```powershell
+cd "$env:USERPROFILE\Local Sites\<site-name>\figma-elementor-agent"
+Copy-Item config.example.json config.json
+notepad config.json
+```
+
+```json
+{
+  "wp_url": "http://<site-name>.local",
+  "wp_user": "admin",
+  "wp_password": "<password you set in LocalWP>",
+  "theme_slug": "hello-elementor"
+}
+```
+
+LocalWP edits the Windows hosts file so `<site-name>.local` resolves. Open
+it in a browser to confirm.
+
+### 4. Register agents + skills with Claude Code
+
+Windows doesn't have `ln -s`. Two options:
+
+**Junction — recommended; no admin required:**
+```powershell
+cd "$env:USERPROFILE\Local Sites\<site-name>\figma-elementor-agent"
+New-Item -ItemType Directory -Force -Path .claude | Out-Null
+cmd /c mklink /J .claude\agents agents
+cmd /c mklink /J .claude\skills skills
+```
+
+**Symbolic link — needs Developer Mode or an admin PowerShell:**
+```powershell
+New-Item -ItemType SymbolicLink -Path .claude\agents -Target "$((Resolve-Path agents).Path)"
+New-Item -ItemType SymbolicLink -Path .claude\skills -Target "$((Resolve-Path skills).Path)"
+```
+
+Enable Developer Mode under **Settings → Privacy & Security → For Developers**
+if you want real symlinks. Junctions work equally well for this use case.
+
+### 5. Run
+
+```powershell
+claude
+```
+
+Type `start` in the Claude prompt. Same flow as macOS — bootstrap, then
+"Proceed? [Y/n]", then phases.
+
+On Windows the orchestrator invokes `.venv\Scripts\python.exe`. When you
+call scripts directly later, use that path (not `.venv/bin/python`).
+
+If Playwright browsers are missing:
+```powershell
+cd scripts
+npx playwright install chromium
+```
+
+### Windows-specific gotchas
+
+- **Paths with spaces** (`Local Sites`): always quote in PowerShell.
+- **Long path support** — enable if PHP/pip complains about `MAX_PATH`. From
+  admin PowerShell:
+  ```powershell
+  New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+      -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+  ```
+- **Antivirus** can slow the first `npm install` + Playwright install
+  dramatically. Let it finish.
+- **WSL2 alternative** — if Windows-specific issues pile up, run the agent
+  inside WSL2 (Ubuntu). The bridge plugin runs in PHP on the LocalWP side,
+  the agent runs in Linux, communication is plain HTTP. Setup from there
+  matches macOS step-for-step.
+
+## Daily use — building pages
+
+After setup, every build looks like this:
+
+1. Make sure **LocalWP is running** the target site.
+2. Drop your Figma export ZIP into the same place as before. Overwrite the
+   previous one — filename doesn't matter.
+3. From a terminal in the agent folder:
+   ```bash
+   cd <path-to>/figma-elementor-agent
+   claude
+   ```
+4. Type one of these in the Claude prompt:
+
+   | Command | What runs |
+   |---------|-----------|
+   | `start` | Full build — globals, header, footer, page, visual diff. Use for the **home page**. |
+   | `start --page-only` | Skip globals + header/footer + reuse. Use for the **2nd + Nth pages** on the same site. |
+   | `start --page-only --page-slug about` | Page-only with an explicit slug. |
+   | `start no confirmations` | Skip the "Proceed? [Y/n]" prompt. |
+   | `start build only the hero, skip the footer` | Free-form scoping in natural language. |
+
+5. The orchestrator streams progress, pauses once before WP writes, then
+   prints the live URL + edit URL when it's done.
+
+The first page on each new site is the **home page** — its ZIP should contain
+header / footer / globals. Subsequent pages auto-skip those phases when
+`project-state.json` shows a prior successful run (the `--page-only` flag
+becomes optional at that point).
 
 ## What the orchestrator bootstraps for you
 
@@ -121,17 +330,6 @@ K.  Auto-fix         auto-fixer
                        • dispatches Claude sub-Agents for visual reasoning
                        • stops after 3 iterations
 ```
-
-## Required developer setup (one time)
-
-| Where | What |
-|-------|------|
-| WordPress | Permalinks → **Post name** (Settings → Permalinks). REST 404s on "Plain". |
-| WordPress | Elementor plugin installed and active. **Elementor Pro** is recommended (Theme Builder header/footer auto-applies; popups; nav-menu widget). |
-| WordPress | Theme that supports `menu-1` / `menu-2` locations. Hello Elementor does. |
-| WordPress (optional) | **Gravity Forms** — when present, the agent auto-creates GF forms for any `role=form` section and replaces the visual mock-up with `[gravityform id=N]`. Without GF the form mock-up stays in place. |
-
-Everything else is automated.
 
 ## Project layout
 
@@ -323,7 +521,9 @@ documented in `CLAUDE.md`).
 
 ## Direct CLI use (power users)
 
-After the first `start` has bootstrapped, every script runs standalone:
+After the first `start` has bootstrapped, every script runs standalone.
+Examples are written for macOS/Linux — on Windows, swap `.venv/bin/python`
+for `.venv\Scripts\python.exe` and forward slashes for back slashes.
 
 ```bash
 # End-to-end import
@@ -463,6 +663,20 @@ form intelligence, dynamic content, design tokens, prompt templates.
 - Shouldn't happen — templates are slug-upserted via the bridge. If you
   see duplicates, the prior run probably left a template in the trash;
   empty the trash in `wp-admin → Templates` and re-run.
+
+**Windows: `claude` says "What would you like to start?"**
+- CLAUDE.md wasn't loaded — you ran `claude` from the wrong folder. `cd`
+  into `figma-elementor-agent/` (the folder containing `CLAUDE.md`) before
+  launching `claude`.
+
+**Windows: `mklink` fails with "You do not have sufficient privilege"**
+- That's the symbolic-link path needing admin or Developer Mode. Use the
+  junction form (`mklink /J`) instead — it works without elevation.
+
+**Windows: `python` not found**
+- The python.org installer's "Add to PATH" checkbox wasn't ticked. Either
+  reinstall and tick it, or add `C:\Users\<you>\AppData\Local\Programs\Python\Python3xx\`
+  to your PATH manually.
 
 ## Claude-as-Author pattern
 
