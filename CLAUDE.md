@@ -197,11 +197,34 @@ Bound the loop:
 
 - **Never** hardcode credentials, URLs, or paths — read from `project-config.json`.
 - **Never** modify the homepage of a target site without explicit confirmation.
+- **Never** print `✓ Build complete` while `scripts/verify_quality.py`
+  exits non-zero. The quality gate is mandatory: drift ≤ 5% across all
+  captured breakpoints, header + footer placements present, global
+  coverage ≥ 70% (colors AND typography). Otherwise report `✗ FAILED`
+  with the failing checks.
+- **Never** silently fall through to inline header/footer. The importer
+  enforces a Theme Builder gate (`--require-theme-builder`, default ON);
+  if header AND footer aren't detected, the build aborts with exit code 7
+  and prints how to fix it. Use `--no-require-theme-builder` only for
+  intentional single-page builds.
+- **Never** pass `--reset-media` or `--reset-menus` without
+  `--confirm-destructive`. The importer aborts otherwise.
 - **Always** dry-run unfamiliar REST writes (`--dry-run`) before sending live.
 - **Always** upload assets before rewriting URLs in `_elementor_data`.
 - **Always** capture before/after screenshots when auto-fixer mutates a page.
 - **Always** stop the auto-fix loop after 3 iterations and report remaining drift.
+- **Always** capture three viewports (desktop / tablet / mobile). The
+  default `scripts/visual_compare.py` invocation does this; the quality
+  gate fails when any captured breakpoint exceeds the drift threshold.
+- **Always** dispatch Claude-as-Author for sections with confidence < 0.6
+  OR live-vs-expected drift > 15%. Use `scripts/claude_review.py --build`
+  to materialize the bundles, then call the `Agent` tool with the bundle
+  contents and its `instructions` field. Apply each result. Cap at 5
+  dispatches per build.
 - **Never** rely 100% on the Figma plugin's high-level decisions. Plugin
   signals (`preferredWidget`, `sectionPurpose`, `_ai_role`) are inputs,
-  not gospel. The agent's own structural detectors must produce a
-  classification independently and the highest-confidence answer wins.
+  not gospel. When `_ai_confidence < 0.6` the plugin has *abstained* —
+  the agent's geometric / structural / name analysis is allowed to outrank
+  it. Hidden layers and zero-opacity nodes are filtered before any
+  classification runs (`section_finder.filter_hidden`). Groups without
+  auto-layout get inferred via `auto_layout_inference.py`.

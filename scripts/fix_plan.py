@@ -90,9 +90,15 @@ def build_fix_plan(top: int | None = None) -> list[dict]:
         if y_band in manual_bands:
             kind = "manual_review"
             auto = False
+        elif drift >= 0.15:
+            # High-drift regions should go to Claude review, not heuristic
+            # spacing/typography patches. Auto-patching a structural mismatch
+            # by tweaking padding burns iteration budget and rarely converges.
+            kind = "manual_review"
+            auto = False
         else:
-            kind = "spacing" if drift < 0.3 else "structural"
-            auto = drift < 0.5  # >= 50% drift is too risky to auto-patch
+            kind = "spacing" if drift < 0.10 else "typography"
+            auto = True
         plan.append({
             "kind": kind,
             "source": "visual-diff",

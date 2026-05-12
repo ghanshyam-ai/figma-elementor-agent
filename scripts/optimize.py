@@ -358,6 +358,8 @@ def enforce_widget_preferences(content: list, e: Enrichment) -> int:
         return 0
     n = 0
     for el, sec in _zip_top_level(content, e):
+        if _is_vision_authored(el):
+            continue
         pref = sec.get("preferredWidget")
         if not pref:
             continue
@@ -536,12 +538,45 @@ def _serialize_panel_body(node: dict) -> str:
 # Image carousel  (>=3 sibling images in a row)
 # ---------------------------------------------------------------------------
 
+_CAROUSEL_NAME_RE = __import__("re").compile(
+    r"\b(carousel|slider|gallery|swiper|logo[- ]?strip|logo[- ]?cloud|marquee)\b",
+    __import__("re").IGNORECASE,
+)
+
+
 def _looks_like_image_carousel(el: dict) -> bool:
-    kids = el.get("elements") or []
+    """Tight image-carousel detection.
+
+    A row of N images is NOT enough — feature grids, footer columns, and
+    logo strips all share that shape. To claim "carousel" we require BOTH:
+      (a) ≥3 sibling images in a single horizontal row (`flex_direction` set
+          to row OR no direction set + multiple image children), AND
+      (b) the container's `_figma_name` matches a carousel-ish word, OR the
+          container has `nowrap` set, OR the parent is constrained-width
+          (`min_height` reasonable for a slider).
+
+    Why: the previous detector swept up every 3-image footer row and feature
+    grid, producing confidently-wrong widget swaps. Now we abstain unless
+    the design actually screams carousel.
+    """
     if el.get("elType") != "container":
         return False
+    kids = el.get("elements") or []
     direct_imgs = [c for c in kids if isinstance(c, dict) and c.get("widgetType") == "image"]
-    return len(direct_imgs) >= 3
+    if len(direct_imgs) < 3:
+        return False
+    s = el.get("settings") or {}
+    name = s.get("_figma_name") or ""
+    if _CAROUSEL_NAME_RE.search(name):
+        return True
+    flex_wrap = s.get("flex_wrap") or ""
+    flex_direction = s.get("flex_direction") or ""
+    if flex_wrap == "nowrap" and flex_direction in ("row", "row-reverse"):
+        # Horizontal nowrap row of images = carousel pattern.
+        return True
+    # Otherwise abstain — let Claude-as-Author or the dynamic-content
+    # detector decide.
+    return False
 
 
 def _convert_to_image_carousel(el: dict) -> bool:
@@ -782,14 +817,31 @@ SOCIAL_ICON_RE = __import__("re").compile(
 )
 
 
+_SOCIAL_URL_RE = __import__("re").compile(
+    r"\b(facebook|twitter|x|instagram|linkedin|youtube|youtu\.be|tiktok|github|pinterest|wa\.me|whatsapp|t\.me|telegram|discord|threads)\b",
+    __import__("re").IGNORECASE,
+)
+
+
 def _looks_like_social_icons(el: dict) -> bool:
+    """Social-icons row: ≥2 icons whose icon-class OR link URL is a known social host.
+
+    Tightened from "≥2 icons with names that match social brand keywords"
+    because plain icon names like "facebook" can appear on contact pages
+    that aren't social-rows. Now we also accept link-host evidence so a
+    row of styled icon-buttons linking to twitter.com / fb.com / etc. is
+    recognised even when the icon glyph itself is generic.
+    """
     kids = [c for c in (el.get("elements") or []) if isinstance(c, dict) and c.get("widgetType") == "icon"]
     if len(kids) < 2:
         return False
-    matches = sum(
-        1 for c in kids
-        if SOCIAL_ICON_RE.search(str((c.get("settings") or {}).get("selected_icon", {}).get("value", "")))
-    )
+    matches = 0
+    for c in kids:
+        s = c.get("settings") or {}
+        icon_name = str((s.get("selected_icon") or {}).get("value", ""))
+        link_url = str((s.get("link") or {}).get("url", ""))
+        if SOCIAL_ICON_RE.search(icon_name) or _SOCIAL_URL_RE.search(link_url):
+            matches += 1
     return matches >= 2 and matches >= len(kids) // 2
 
 
@@ -1041,6 +1093,110 @@ def _convert_to_nav_menu(el: dict) -> bool:
 # ---------------------------------------------------------------------------
 # Registry: PreferredWidget → (detector, converter)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Responsive defaults — Elementor reads `_mobile` / `_tablet` suffix settings
+# natively. The plugin emits zero responsive data; this pass writes sensible
+# defaults so the live page stacks on mobile and shrinks heading sizes.
+# ---------------------------------------------------------------------------
+
+# Mobile font-size scale: anything over 32px on desktop gets shrunk to ~58%
+# (capped at 16px floor). Anything under 32px stays — body text shouldn't
+# get smaller on mobile.
+_MOBILE_HEADING_FLOOR_PX = 32
+_MOBILE_FONT_SCALE = 0.58
+_MIN_MOBILE_FONT = 16
+_TABLET_FONT_SCALE = 0.75
+
+
+def _scale_font(size_dict: dict, scale: float, min_px: int) -> dict | None:
+    if not isinstance(size_dict, dict):
+        return None
+    s = size_dict.get("size")
+    if not isinstance(s, (int, float)) or s <= _MOBILE_HEADING_FLOOR_PX:
+        return None
+    new_size = max(float(min_px), round(float(s) * scale))
+    out = dict(size_dict)
+    out["size"] = new_size
+    return out
+
+
+def apply_responsive_defaults(content: list) -> dict:
+    """Stamp `_mobile` / `_tablet` overrides onto containers + headings.
+
+    For every container:
+      • `flex_direction_mobile = "column"`  (stack on mobile)
+      • `flex_wrap_mobile = "wrap"`         (allow wrap on mobile)
+      • `padding_mobile` shrinks padding to ~60% of desktop
+
+    For every heading / text widget whose typography_font_size > 32px:
+      • `typography_font_size_mobile = max(16, size * 0.58)`
+      • `typography_font_size_tablet = max(16, size * 0.75)`
+
+    These are no-ops on settings that already exist — running this twice
+    will not overwrite manual values.
+    """
+    stats = {"containers": 0, "headings": 0}
+
+    def visit(node: dict) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("elType") == "container":
+            s = node.setdefault("settings", {})
+            if "flex_direction_mobile" not in s:
+                s["flex_direction_mobile"] = "column"
+            if "flex_wrap_mobile" not in s:
+                s["flex_wrap_mobile"] = "wrap"
+            pad = s.get("padding")
+            if isinstance(pad, dict) and "padding_mobile" not in s:
+                def shrink(v):
+                    try:
+                        return str(max(8, int(float(v) * 0.6)))
+                    except (TypeError, ValueError):
+                        return v
+                s["padding_mobile"] = {
+                    "unit": pad.get("unit", "px"),
+                    "top": shrink(pad.get("top", "0")),
+                    "right": shrink(pad.get("right", "0")),
+                    "bottom": shrink(pad.get("bottom", "0")),
+                    "left": shrink(pad.get("left", "0")),
+                    "isLinked": pad.get("isLinked", False),
+                }
+            stats["containers"] += 1
+        if node.get("elType") == "widget" and node.get("widgetType") in ("heading", "text-editor", "button"):
+            s = node.setdefault("settings", {})
+            base = s.get("typography_font_size")
+            if isinstance(base, dict):
+                mobile = _scale_font(base, _MOBILE_FONT_SCALE, _MIN_MOBILE_FONT)
+                tablet = _scale_font(base, _TABLET_FONT_SCALE, _MIN_MOBILE_FONT)
+                if mobile and "typography_font_size_mobile" not in s:
+                    s["typography_font_size_mobile"] = mobile
+                    stats["headings"] += 1
+                if tablet and "typography_font_size_tablet" not in s:
+                    s["typography_font_size_tablet"] = tablet
+        for c in node.get("elements") or []:
+            visit(c)
+
+    for top in content:
+        visit(top)
+    return stats
+
+
+def mark_vision_authored(node: dict) -> None:
+    """Tag a subtree as authored by Claude vision so heuristic detectors
+    skip it on subsequent passes. Used by the claude-review pipeline."""
+    if not isinstance(node, dict):
+        return
+    s = node.setdefault("settings", {})
+    s["_vision_authored"] = True
+    for c in node.get("elements") or []:
+        mark_vision_authored(c)
+
+
+def _is_vision_authored(el: dict) -> bool:
+    s = (el or {}).get("settings") or {}
+    return bool(s.get("_vision_authored"))
+
 
 WIDGET_PREF_HANDLERS: dict[str, tuple] = {
     "icon-list":            (_looks_like_icon_list, _convert_to_icon_list),

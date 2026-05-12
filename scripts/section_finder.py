@@ -56,14 +56,15 @@ class RealSection:
 # ---------------------------------------------------------------------------
 
 NAME_RX = {
-    "header":  re.compile(r"^(header|nav(bar)?|topbar|top[- ]?nav)\b", re.IGNORECASE),
-    "footer":  re.compile(r"^footer\b|\bsite[- ]?footer\b", re.IGNORECASE),
-    "hero":    re.compile(r"^hero\b|\bbanner\b|\bhero[- ]?slider\b", re.IGNORECASE),
-    "popup":   re.compile(r"\b(popup|modal|dialog|overlay|lightbox)\b", re.IGNORECASE),
-    "archive": re.compile(r"\b(archive|blog[- ]?list|posts?[- ]?grid)\b", re.IGNORECASE),
-    "single":  re.compile(r"\b(single[- ]?post|post[- ]?detail|article[- ]?detail)\b", re.IGNORECASE),
-    "search":  re.compile(r"\b(search[- ]?result|search[- ]?page)\b", re.IGNORECASE),
-    "404":     re.compile(r"\b(404|not[- ]?found)\b", re.IGNORECASE),
+    "header":        re.compile(r"^(header|nav(bar)?|topbar|top[- ]?nav|site[- ]?header)\b", re.IGNORECASE),
+    "footer":        re.compile(r"^footer\b|\bsite[- ]?footer\b|\bpage[- ]?footer\b", re.IGNORECASE),
+    "footer-column": re.compile(r"\bfooter[- ]?(col(umn)?|links?|menu|nav|section|widget)\b", re.IGNORECASE),
+    "hero":          re.compile(r"^hero\b|\bbanner\b|\bhero[- ]?slider\b", re.IGNORECASE),
+    "popup":         re.compile(r"\b(popup|modal|dialog|overlay|lightbox)\b", re.IGNORECASE),
+    "archive":       re.compile(r"\b(archive|blog[- ]?list|posts?[- ]?grid)\b", re.IGNORECASE),
+    "single":        re.compile(r"\b(single[- ]?post|post[- ]?detail|article[- ]?detail)\b", re.IGNORECASE),
+    "search":        re.compile(r"\b(search[- ]?result|search[- ]?page)\b", re.IGNORECASE),
+    "404":           re.compile(r"\b(404|not[- ]?found)\b", re.IGNORECASE),
 }
 
 # Sections we want to surface even though they live nested. Ordered: most
@@ -73,6 +74,11 @@ PURPOSE_TO_KIND = {
     "footer": "footer",
     "hero":   "hero",
 }
+
+# Plugin signals below this confidence get treated as "abstained" — the
+# agent's own structural / geometric analysis is allowed to outrank them
+# instead of being suppressed by a low-confidence plugin guess.
+PLUGIN_TRUST_FLOOR = 0.6
 
 
 def find_real_sections(
@@ -140,8 +146,15 @@ def _score_node(
     name = settings.get("_figma_name") or (ai or {}).get("name") or ""
     plugin_purpose = settings.get("_figma_section_purpose") or (ai or {}).get("sectionPurpose")
     plugin_role = settings.get("_ai_role") or (ai or {}).get("role")
-    plugin_conf = settings.get("_ai_confidence") or (ai or {}).get("confidence")
+    plugin_conf_raw = settings.get("_ai_confidence") or (ai or {}).get("confidence")
+    plugin_conf = float(plugin_conf_raw) if isinstance(plugin_conf_raw, (int, float)) else None
     bounds = (ai or {}).get("bounds")
+
+    # Plugin abstained when its own confidence is below the trust floor.
+    # Surface the value as a *hint* but allow geometric/structural signals
+    # to outrank it. This is the fix for the audit case where 12/14 real
+    # frames had sectionPurpose at 0.35 confidence.
+    plugin_trustworthy = (plugin_conf is None) or (plugin_conf >= PLUGIN_TRUST_FLOOR)
 
     kind: str | None = None
     confidence: float = 0.0
@@ -150,15 +163,25 @@ def _score_node(
 
     # --- Signal 1: plugin sectionPurpose --------------------------------
     if plugin_purpose in PURPOSE_TO_KIND:
-        kind = PURPOSE_TO_KIND[plugin_purpose]
-        confidence = max(confidence, float(plugin_conf or 0.85))
-        reasons.append(f"sectionPurpose={plugin_purpose}")
-        inferred = False
+        score = float(plugin_conf if plugin_conf is not None else 0.85)
+        if plugin_trustworthy:
+            kind = PURPOSE_TO_KIND[plugin_purpose]
+            confidence = max(confidence, score)
+            reasons.append(f"sectionPurpose={plugin_purpose}")
+            inferred = False
+        else:
+            reasons.append(f"sectionPurpose={plugin_purpose}@{score:.2f}-hint")
 
     # --- Signal 2: plugin _ai_role --------------------------------------
     if plugin_role in ("navbar", "footer", "hero"):
         candidate_kind = "header" if plugin_role == "navbar" else plugin_role
-        score = float(plugin_conf or 0.8)
+        score = float(plugin_conf if plugin_conf is not None else 0.8)
+        # navbar/footer roles are structural facts — even at low confidence
+        # they're worth ≥0.9 in our scoring because header/footer detection
+        # is a hard gate and we'd rather have a Theme Builder template than
+        # an inline navbar in the page body.
+        if candidate_kind in ("header", "footer") and score < 0.9:
+            score = 0.9
         if not kind or score > confidence:
             kind = candidate_kind
             confidence = score
@@ -168,9 +191,11 @@ def _score_node(
             reasons.append(f"role={plugin_role}-confirms")
 
     # --- Signal 3: layer-name regex (independent of plugin quality) ----
+    # When the plugin abstained, name-based detection carries more weight.
+    name_score_base = 0.7 if plugin_trustworthy else 0.85
     for k, rx in NAME_RX.items():
         if rx.search(name):
-            score = 0.7  # name-based is decent but not authoritative
+            score = name_score_base
             if not kind:
                 kind = k
                 confidence = score
@@ -187,26 +212,40 @@ def _score_node(
             break
 
     # --- Signal 4: geometric — top-of-page full-bleed = header ---------
-    if not kind and bounds:
+    # Geometric weight is boosted when the plugin abstained.
+    geom_floor = 0.6 if plugin_trustworthy else 0.8
+    if (not kind or not plugin_trustworthy) and bounds:
         x, y, w, h = bounds.get("x", 0), bounds.get("y", 0), bounds.get("width", 0), bounds.get("height", 0)
         is_top = y < 100
         is_bottom = (y > 4000) and (h < 1500) and (h > 100)
         is_full_width = w >= 1200
+        candidate_kind = None
+        candidate_conf = 0.0
         if is_top and is_full_width and h < 200:
-            kind = "header"
-            confidence = 0.6
-            reasons.append("geometric: y<100, full-width, slim")
+            candidate_kind = "header"
+            candidate_conf = max(geom_floor, 0.6)
+            extra_reason = "geometric: y<100, full-width, slim"
         elif is_bottom and is_full_width:
-            kind = "footer"
-            confidence = 0.55
-            reasons.append("geometric: bottom of page, full-width")
+            candidate_kind = "footer"
+            candidate_conf = max(geom_floor, 0.55)
+            extra_reason = "geometric: bottom of page, full-width"
+        else:
+            extra_reason = None
+        if candidate_kind and candidate_conf > confidence:
+            kind = candidate_kind
+            confidence = candidate_conf
+            reasons.append(extra_reason)
 
     # --- Signal 5: structural — first child is full-bleed image+text → hero
     if not kind and depth <= 2:
         if _looks_like_hero(el):
             kind = "hero"
-            confidence = 0.55
+            confidence = 0.55 if plugin_trustworthy else 0.7
             reasons.append("structural: full-bleed-image + heading + cta")
+
+    # --- Signal 6: footer column (nested kind — only fires inside footer)
+    # Skipped here because we need the parent context to confirm; handled
+    # by `extract_footer_columns()` post-walk instead.
 
     # If we still don't know, this isn't a "real section" worth routing —
     # it's just a layout container.
@@ -221,7 +260,7 @@ def _score_node(
         depth=depth,
         ai_section=ai,
         confidence=confidence,
-        reason=" + ".join(reasons),
+        reason=" + ".join(r for r in reasons if r),
         figma_purpose=plugin_purpose,
         figma_role=plugin_role,
         figma_name=name,
@@ -364,6 +403,161 @@ def summarize(sections: list[RealSection]) -> dict[str, int]:
     for s in sections:
         out[s.kind] = out.get(s.kind, 0) + 1
     return out
+
+
+def infer_name_for_unnamed(el: dict) -> str | None:
+    """Generate a synthetic name for a container with no `_figma_name`.
+
+    Useful when name-regex detection is the only available signal and the
+    Figma file has generic auto-names. Returns a hint like
+    `Section-3-images-1-heading` so downstream regex / heuristics can fire.
+    """
+    if not isinstance(el, dict):
+        return None
+    s = el.get("settings") or {}
+    if s.get("_figma_name") or s.get("_inferred_name"):
+        return s.get("_figma_name") or s.get("_inferred_name")
+    counts: dict[str, int] = {}
+    def walk(n, d):
+        if d > 4 or not isinstance(n, dict):
+            return
+        wt = n.get("widgetType")
+        if wt:
+            counts[wt] = counts.get(wt, 0) + 1
+        for c in n.get("elements") or []:
+            walk(c, d + 1)
+    walk(el, 0)
+    if not counts:
+        return None
+    parts = [f"{v}-{k}" for k, v in sorted(counts.items(), key=lambda x: -x[1])[:3]]
+    return "Section-" + "-".join(parts)
+
+
+def extract_footer_columns(footer_section: RealSection) -> list[RealSection]:
+    """Find link columns inside a detected footer.
+
+    A footer column is a column-direction container (or a vertical stack of
+    text/button widgets) holding ≥ 2 link-like children. Each becomes its
+    own `RealSection(kind="footer-column")` so the importer can create one
+    nav menu per column instead of dumping every link into one menu.
+    """
+    if footer_section.kind != "footer":
+        return []
+    columns: list[RealSection] = []
+    node = footer_section.elementor_node
+
+    def link_count(container: dict) -> int:
+        c = 0
+        for kid in container.get("elements") or []:
+            if not isinstance(kid, dict):
+                continue
+            wt = kid.get("widgetType")
+            if wt in ("button", "text-editor"):
+                c += 1
+        return c
+
+    def visit(n: dict, parent: list, idx: int, depth: int) -> None:
+        if not isinstance(n, dict):
+            return
+        if n.get("elType") == "container":
+            settings = n.get("settings") or {}
+            direction = settings.get("flex_direction") or ""
+            is_column = (direction in ("column", "")) or (
+                # No explicit direction but children are stacked vertically:
+                # treat any container with ≥3 stacked link-like widgets as a column
+                link_count(n) >= 3
+            )
+            name = settings.get("_figma_name") or ""
+            matched_by_name = bool(NAME_RX["footer-column"].search(name))
+            if depth >= 1 and is_column and (link_count(n) >= 2 or matched_by_name):
+                columns.append(RealSection(
+                    kind="footer-column",
+                    elementor_node=n,
+                    parent_list=parent,
+                    parent_index=idx,
+                    depth=depth,
+                    ai_section=None,
+                    confidence=0.9 if matched_by_name else 0.65,
+                    reason=("name~=footer-column" if matched_by_name else
+                            f"structural: {link_count(n)} link-like children"),
+                    figma_purpose=None,
+                    figma_role=settings.get("_ai_role"),
+                    figma_name=name,
+                    bounds=None,
+                    inferred=not matched_by_name,
+                ))
+                # Don't recurse into a column — its children are leaf links.
+                return
+            for i, c in enumerate(n.get("elements") or []):
+                visit(c, n.get("elements") or [], i, depth + 1)
+
+    visit(node, [node], 0, 0)
+    return columns
+
+
+def extract_nav_items(section: RealSection) -> list[dict]:
+    """Walk a header/footer-column section and produce real menu items.
+
+    Returns `[{title, url}, ...]` from the text/button widgets found. Skips
+    image widgets (those are the plugin's failure mode where columns get
+    baked into raster) — callers should fall back to a Claude OCR dispatch
+    in that case.
+    """
+    items: list[dict] = []
+    def walk(n, d):
+        if d > 6 or not isinstance(n, dict):
+            return
+        wt = n.get("widgetType")
+        s = n.get("settings") or {}
+        if wt == "button":
+            title = (s.get("text") or "").strip()
+            url = ((s.get("link") or {}).get("url") or "").strip() or "#"
+            if title:
+                items.append({"title": title, "url": url})
+        elif wt == "heading":
+            # Headings in a column are typically the column's section header
+            # ("Company", "Resources") — not a menu item. Skip.
+            pass
+        elif wt == "text-editor":
+            raw = s.get("editor") or ""
+            # Strip HTML tags for a single label; multi-paragraph text is
+            # not a menu item.
+            import re as _re
+            txt = _re.sub(r"<[^>]+>", " ", raw).strip()
+            txt = _re.sub(r"\s+", " ", txt)
+            if txt and len(txt) <= 60 and "\n" not in raw:
+                items.append({"title": txt, "url": "#"})
+        for c in n.get("elements") or []:
+            walk(c, d + 1)
+    walk(section.elementor_node, 0)
+    return items
+
+
+def filter_hidden(content: list) -> int:
+    """Drop nodes the plugin marked hidden (`_visible == False` or opacity 0).
+
+    Hidden Figma layers should never render in the live page. The plugin
+    sometimes leaks them through; this is the agent's defensive filter.
+    Returns the count of nodes removed.
+    """
+    removed = 0
+    def visit(elements: list) -> None:
+        nonlocal removed
+        i = 0
+        while i < len(elements):
+            n = elements[i]
+            if isinstance(n, dict):
+                s = n.get("settings") or {}
+                vis = s.get("_visible")
+                opa = s.get("opacity")
+                if vis is False or (isinstance(opa, (int, float)) and opa <= 0):
+                    elements.pop(i)
+                    removed += 1
+                    continue
+                visit(n.get("elements") or [])
+            i += 1
+    visit(content)
+    return removed
 
 
 def detach(section: RealSection) -> None:

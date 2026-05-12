@@ -1,21 +1,37 @@
 ---
 name: wp-architecture
-description: How the agent routes each Figma section to the right WordPress / Elementor surface — Theme Builder (header / footer), Pop-up Builder, Archive / Single templates, or page content. Driven by ai-layout's `sectionPurpose` first, semantic role second, layer-name regex last.
+description: How the agent routes each Figma section to the right WordPress / Elementor surface — Theme Builder (header / footer), Pop-up Builder, Archive / Single templates, or page content. Multi-signal scoring (plugin signals + name regex + geometric + structural); plugin signals below 0.6 confidence are treated as hints, not facts.
 ---
 
 # WordPress architecture router
 
-Backed by `scripts/architecture.py`. The router answers one question per
-top-level Figma section: **where on the WordPress site does this belong?**
+Backed by `scripts/architecture.py` + `scripts/section_finder.py`. The
+router answers one question per Figma section (at any depth, not just
+top-level): **where on the WordPress site does this belong?**
 
-## Decision sources, in priority order
+## Decision sources — multi-signal, no single oracle
 
-1. **`sectionPurpose`** from `ai-layout.json` — the most reliable signal,
-   set by the plugin's `aiLayout.ts` from descendant counts + name regex.
-2. **`role`** (`SemanticRole`) — used when sectionPurpose is `content`
-   but the role is `navbar` / `footer`.
-3. **Figma layer name** — case-insensitive regexes for popup, archive,
-   single, search, 404. Only fires when 1 + 2 didn't already decide.
+The router scores every container with five independent detectors and
+picks the highest-confidence kind. **No single signal is authoritative.**
+
+1. **`sectionPurpose`** from `ai-layout.json` (plugin hint).
+   * Only trusted when the plugin's own confidence ≥ 0.6.
+   * Below 0.6, treated as a *hint* logged in the section's `reason`
+     but allowed to be outranked by signals 2-5.
+2. **`_ai_role` / `role`** (plugin semantic role).
+   * Boosted: `navbar` / `footer` get a 0.9 floor because Theme Builder
+     placement is a hard gate — we want a template, not inline content.
+3. **Layer-name regex** — `Header|Navbar|Topbar|Site Header`,
+   `Footer|Site Footer`, `Footer Column|Footer Links`, `Hero|Banner`,
+   `Popup|Modal`, `Archive|Blog List`, `Single Post`, etc.
+   * Carries more weight when the plugin abstained (confidence < 0.6).
+4. **Geometric** — top-of-page slim full-width = header; bottom-of-page
+   full-width = footer.
+5. **Structural** — full-bleed image + heading + button = hero;
+   N stacked link-like widgets inside a footer container = footer column.
+
+When two detectors disagree by < 0.1, the section is marked
+`ambiguous` and the orchestrator dispatches Claude-as-Author for it.
 
 ## sectionPurpose → routing target
 
@@ -62,12 +78,24 @@ through one declarative table keeps each kind a one-line decision.
 
 ```python
 [
-  Placement(kind='header',  section_index=0, reason='sectionPurpose=navbar', ...),
-  Placement(kind='page',    section_index=1, reason='default (purpose=hero)', ...),
-  Placement(kind='popup',   section_index=2, reason='name~=popup', ...),
-  Placement(kind='footer',  section_index=3, reason='sectionPurpose=footer', ...),
+  Placement(kind='header',         section_index=0, reason='role=navbar + name~=header', ...),
+  Placement(kind='page',           section_index=1, reason='default (purpose=hero@0.35-hint)', ...),
+  Placement(kind='popup',          section_index=2, reason='name~=popup', ...),
+  Placement(kind='footer',         section_index=3, reason='sectionPurpose=footer', ...),
+  Placement(kind='footer-column',  section_index=4, reason='structural: 5 link-like children', ...),
 ]
 ```
 
 `page_content(placements)` returns just the nodes that should land on
-the actual page; everything else is consumed by `client.create_template()`.
+the actual page; everything else is consumed by `client.create_template()`
+or by the menu-creation phase (footer-columns each become their own
+nav-menu post).
+
+## Theme Builder gate (mandatory)
+
+The importer aborts with exit code 7 when header AND footer are not
+both detected (unless `--no-require-theme-builder` is passed). This is
+the user-requirement-driven gate: header/footer MUST be Theme Builder
+templates, never inline content on the page body. If detection fails,
+the agent prompts the developer to add `header_pattern` /
+`footer_pattern` overrides to `project-config.json` and re-run.

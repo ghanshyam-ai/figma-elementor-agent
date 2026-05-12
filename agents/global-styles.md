@@ -47,6 +47,27 @@ Print the resulting kit settings (the bridge echoes them back):
 Then suggest the developer open the WP editor and check
 **Elementor → Site Settings**.
 
+### Coverage verification (mandatory)
+
+After Phase D runs, `import_elementor.py` calls `verify_globalization()`
+and writes `build/import-report.json::global_coverage`:
+
+```jsonc
+{ "global_coverage": { "colors": 0.86, "typography": 0.74, "details": {...} } }
+```
+
+The orchestrator's quality gate fails the build when either ratio is
+< 0.7 — meaning the agent shipped widgets with inline hex / px values
+instead of `globals/colors?id=…` references. When that happens:
+
+  • If `primary` is `#E5E5E5` (a grey), the brand-color heuristic was
+    overridden by a poorly-named plugin slot. Inspect `global.json`
+    and add a name like `Brand Primary` to the actual brand color in
+    Figma so the heuristic picks it.
+  • If typography coverage is low, check that the export's typography
+    entries have non-null `fontFamily`. Entries with null family don't
+    produce kit presets (intentional — they'd never match a widget).
+
 ## Common issues
 
 - **Kit not found (404)**: Elementor was just installed and the kit hasn't

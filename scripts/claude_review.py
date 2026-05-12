@@ -1,0 +1,391 @@
+"""
+Build Claude-as-Author review bundles.
+
+This script does NOT call any LLM itself — it prepares the JSON bundle
+that the orchestrator agent dispatches via the Agent tool, and writes
+the bundles to `build/claude-review/` so the agent can read them at
+review time.
+
+Bundle schema (per section):
+    {
+      "section_kind":  "hero" | "feature-grid" | "footer-column" | ...,
+      "node_id":       "<post-regen elementor id>",
+      "figma_node_id": "<original figma node id>",
+      "elementor_json": <current subtree from data.json — the live tree>,
+      "ai_subtree":     <matching ai-layout subtree>,
+      "tokens":         <slice of global.json relevant to this section>,
+      "expected_crop":  "build/<export>/screenshots/sections/<id>.png",
+      "live_crop":      "build/diff/sections/<id>.png" (created later by the reviewer),
+      "kit_globals":    {colors, typography} (selected fields only),
+      "reason":         "confidence=0.35" | "drift=22%" | "no-image-widgets",
+      "confidence":     0.0..1.0,
+      "drift":          0.0..1.0  (when sourced from visual-diff),
+      "instructions":   "Compare expected_crop to live_crop. Return a JSON patch ..."
+    }
+
+Output files: `build/claude-review/section-<idx>.json` (one per dispatch).
+A top-level `build/claude-review/queue.json` lists every bundle the agent
+should process, in priority order, plus the cap (5 dispatches per build).
+
+Usage from CLI (for debugging):
+    python3 scripts/claude_review.py --build --confidence 0.6 --drift 0.15
+    python3 scripts/claude_review.py --list
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+BUILD = ROOT / "build"
+REVIEW_DIR = BUILD / "claude-review"
+
+# Cap per CLAUDE.md line 154: at most 5 Claude-as-Author dispatches per build.
+MAX_DISPATCHES = 5
+
+# Default thresholds — caller can override.
+DEFAULT_CONFIDENCE_FLOOR = 0.6
+DEFAULT_DRIFT_CEILING = 0.15
+
+
+def build_queue(
+    confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
+    drift_ceiling: float = DEFAULT_DRIFT_CEILING,
+    max_dispatches: int = MAX_DISPATCHES,
+) -> list[dict]:
+    """Compile the list of sections that need a Claude review.
+
+    Inputs (all under `build/`):
+      • import-report.json — confidence scores + risk areas
+      • diff/report.json — per-region drift (when visual-reviewer has run)
+      • state.json — export_dir, placements_summary, post-regen id_map
+
+    Returns a list of bundle dicts (highest priority first), capped at
+    `max_dispatches`. Each bundle is also written to disk.
+    """
+    state = _load(BUILD / "state.json")
+    import_report = _load(BUILD / "import-report.json")
+    diff_report = _load(BUILD / "diff" / "report.json")
+    export_dir = Path(state.get("export_dir") or BUILD / "export")
+
+    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+    candidates: list[dict] = []
+
+    # --- Source 1: low-confidence risk areas ---
+    for risk in (import_report.get("riskAreas") or []):
+        if risk.get("kind") != "low-confidence":
+            continue
+        detail = risk.get("detail") or ""
+        # `confidence=0.35` parsing
+        conf = _parse_confidence(detail)
+        if conf is not None and conf >= confidence_floor:
+            continue
+        candidates.append({
+            "source": "low-confidence",
+            "node_id": risk.get("nodeId"),
+            "node_name": risk.get("nodeName"),
+            "confidence": conf,
+            "drift": None,
+            "reason": f"confidence={conf:.2f}" if conf is not None else "no-confidence-score",
+            "severity": risk.get("severity") or "warn",
+            "_score": (1.0 - (conf or 0.0)),
+        })
+
+    # --- Source 2: visual-diff regions with drift > ceiling ---
+    for region in (diff_report.get("regions") or []):
+        drift = region.get("drift") or 0.0
+        if drift < drift_ceiling:
+            continue
+        candidates.append({
+            "source": "visual-diff",
+            "node_id": None,
+            "y_band": [region.get("y0"), region.get("y1")],
+            "drift": drift,
+            "confidence": None,
+            "reason": f"drift={drift*100:.1f}%",
+            "severity": "error" if drift > 0.5 else "warn",
+            "_score": drift,
+        })
+
+    # Sort by score desc; cap at max_dispatches.
+    candidates.sort(key=lambda c: -c["_score"])
+    candidates = candidates[:max_dispatches]
+    for c in candidates:
+        c.pop("_score", None)
+
+    # --- Materialize each candidate as a bundle file ---
+    bundles: list[dict] = []
+    for i, c in enumerate(candidates):
+        bundle = _materialize_bundle(c, i, export_dir)
+        if bundle:
+            bundles.append(bundle)
+            bundle_path = REVIEW_DIR / f"section-{i:02d}.json"
+            bundle_path.write_text(json.dumps(bundle, indent=2, default=str))
+
+    queue_path = REVIEW_DIR / "queue.json"
+    queue_path.write_text(json.dumps({
+        "total": len(bundles),
+        "cap": max_dispatches,
+        "bundles": [b["_path"] for b in bundles],
+    }, indent=2))
+
+    return bundles
+
+
+def _materialize_bundle(candidate: dict, idx: int, export_dir: Path) -> dict | None:
+    """Build the full review bundle for one candidate.
+
+    Looks up the elementor subtree, ai-layout subtree, and matching
+    expected/live crops. Returns None if essential inputs are missing.
+    """
+    node_id = candidate.get("node_id")
+    elementor_json = _load_elementor_subtree(node_id) if node_id else None
+    ai_subtree = _load_ai_subtree(export_dir, node_id, candidate.get("node_name"))
+    tokens = _load_tokens(export_dir)
+
+    expected_crop = _find_expected_crop(export_dir, node_id, ai_subtree)
+    live_crop = _find_live_crop(node_id, candidate.get("y_band"))
+
+    bundle = {
+        "_path": str((REVIEW_DIR / f"section-{idx:02d}.json").resolve()),
+        "section_kind": (ai_subtree or {}).get("role") or (ai_subtree or {}).get("sectionPurpose") or "unknown",
+        "node_id": node_id,
+        "figma_node_id": (ai_subtree or {}).get("id"),
+        "elementor_json": elementor_json,
+        "ai_subtree": ai_subtree,
+        "tokens": tokens,
+        "expected_crop": str(expected_crop) if expected_crop else None,
+        "live_crop": str(live_crop) if live_crop else None,
+        "kit_globals": _selected_kit_globals(),
+        "reason": candidate.get("reason"),
+        "confidence": candidate.get("confidence"),
+        "drift": candidate.get("drift"),
+        "y_band": candidate.get("y_band"),
+        "source": candidate.get("source"),
+        "instructions": (
+            "You are reviewing a single section of an Elementor page that "
+            "was auto-generated from a Figma export. The pixel diff or "
+            "confidence score suggests this section is wrong. Compare "
+            "`expected_crop` (the Figma design) against `live_crop` (the "
+            "rendered page) — or, when no live crop is available, against "
+            "`elementor_json` directly. Decide whether the right Elementor "
+            "widget is used (e.g. nav-menu, icon-list, image-box, accordion, "
+            "tabs, posts) and whether layout / spacing / colors match. "
+            "Return a JSON object: "
+            "`{\"replace_subtree\": <new elementor json>}` to rewrite the "
+            "section, or `{\"patches\": [{op,path,value}, ...]}` for "
+            "targeted RFC-6902 changes. Prefer minimal patches unless the "
+            "widget choice itself is wrong. Reference `kit_globals` to use "
+            "`__globals__` bindings instead of inline hex / px values."
+        ),
+    }
+    return bundle
+
+
+def apply_review_result(bundle_path: Path, result: dict) -> dict:
+    """Apply a Claude review result back to the Elementor tree.
+
+    Result schema (one of):
+      • {"replace_subtree": <node>}     — wholesale replacement
+      • {"patches": [{op,path,value}]}  — RFC-6902-style patches
+      • {"skip": true, "reason": "..."} — Claude abstained
+
+    Returns {"applied": bool, "kind": "replace"|"patch"|"skip", "node_id": ...}.
+    The caller is responsible for re-running `import_elementor.py
+    --skip-bootstrap --replay-claude-review` or POSTing the patched tree.
+    """
+    bundle = json.loads(Path(bundle_path).read_text())
+    out = {"applied": False, "kind": "skip", "node_id": bundle.get("node_id")}
+    if result.get("skip"):
+        out["reason"] = result.get("reason")
+        return out
+    target_path = Path(bundle["_path"]).with_suffix(".applied.json")
+    target_path.write_text(json.dumps(result, indent=2))
+    if "replace_subtree" in result:
+        out["kind"] = "replace"
+        out["applied"] = True
+    elif result.get("patches"):
+        out["kind"] = "patch"
+        out["applied"] = True
+        out["patch_count"] = len(result["patches"])
+    return out
+
+
+# --- internal helpers -----------------------------------------------------
+
+def _load(p: Path) -> dict:
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _parse_confidence(detail: str) -> float | None:
+    import re
+    m = re.search(r"confidence=([\d.]+)", detail or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _load_elementor_subtree(node_id: str | None) -> dict | None:
+    """Look up the current Elementor subtree by id from the live data.
+
+    Uses the `id_map.json` produced by the bridge after iterate_data
+    regenerates ids — see `import_elementor.py` post-page-write block.
+    Falls back to a scan of `build/data.json` if id_map isn't present.
+    """
+    if not node_id:
+        return None
+    id_map = _load(BUILD / "id_map.json")
+    target_id = id_map.get(node_id, node_id) if isinstance(id_map, dict) else node_id
+    data_path = BUILD / "data.json"
+    if not data_path.exists():
+        return None
+    tree = _load(data_path)
+    content = tree.get("content") if isinstance(tree, dict) else tree
+
+    def walk(n):
+        if not isinstance(n, dict):
+            return None
+        if n.get("id") == target_id:
+            return n
+        for c in n.get("elements") or []:
+            r = walk(c)
+            if r is not None:
+                return r
+        return None
+
+    if isinstance(content, list):
+        for top in content:
+            r = walk(top)
+            if r is not None:
+                return r
+    return None
+
+
+def _load_ai_subtree(export_dir: Path, node_id: str | None, name: str | None) -> dict | None:
+    ai_path = export_dir / "ai-layout.json"
+    if not ai_path.exists():
+        return None
+    ai = _load(ai_path)
+    target_name = (name or "").strip().lower()
+    target_id = (node_id or "").strip()
+
+    def walk(sec):
+        if not isinstance(sec, dict):
+            return None
+        if target_id and sec.get("id") == target_id:
+            return sec
+        if target_name and (sec.get("name") or "").strip().lower() == target_name:
+            return sec
+        for c in sec.get("children") or []:
+            r = walk(c)
+            if r is not None:
+                return r
+        return None
+
+    for top in ai.get("sections") or []:
+        r = walk(top)
+        if r is not None:
+            return r
+    return None
+
+
+def _load_tokens(export_dir: Path) -> dict:
+    p = export_dir / "global.json"
+    if not p.exists():
+        p = export_dir / "tokens.json"
+    return _load(p)
+
+
+def _selected_kit_globals() -> dict:
+    """Return the slim slice of kit globals Claude needs: color slugs + typography slugs."""
+    state = _load(BUILD / "state.json")
+    return state.get("kit_globals") or {}
+
+
+def _find_expected_crop(export_dir: Path, node_id: str | None, ai_subtree: dict | None) -> Path | None:
+    if not node_id and not ai_subtree:
+        return None
+    shots = export_dir / "screenshots" / "sections"
+    if not shots.exists():
+        return None
+    candidate_ids = []
+    if node_id:
+        candidate_ids.append(node_id)
+    if ai_subtree and ai_subtree.get("id"):
+        candidate_ids.append(ai_subtree["id"])
+    for cid in candidate_ids:
+        for suffix in (".png", "@2x.png", ".jpg"):
+            p = shots / f"{cid}{suffix}"
+            if p.exists():
+                return p
+    return None
+
+
+def _find_live_crop(node_id: str | None, y_band: list | None) -> Path | None:
+    if not node_id and not y_band:
+        return None
+    crops_dir = BUILD / "diff" / "sections"
+    if not crops_dir.exists():
+        return None
+    if node_id:
+        p = crops_dir / f"{node_id}.png"
+        if p.exists():
+            return p
+    if y_band and len(y_band) == 2:
+        p = crops_dir / f"y{y_band[0]}-{y_band[1]}.png"
+        if p.exists():
+            return p
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--build", action="store_true", help="Build the review queue")
+    ap.add_argument("--list", action="store_true", help="List existing bundles")
+    ap.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE_FLOOR)
+    ap.add_argument("--drift", type=float, default=DEFAULT_DRIFT_CEILING)
+    ap.add_argument("--max", type=int, default=MAX_DISPATCHES)
+    args = ap.parse_args()
+
+    if args.list:
+        queue = _load(REVIEW_DIR / "queue.json")
+        bundles = queue.get("bundles", [])
+        if not bundles:
+            print("(no claude-review queue — run --build first)")
+            return 0
+        for b in bundles:
+            payload = _load(Path(b))
+            print(f"  • {Path(b).name}  kind={payload.get('section_kind')}  "
+                  f"reason={payload.get('reason')}  "
+                  f"expected_crop={payload.get('expected_crop')}")
+        return 0
+
+    if args.build:
+        bundles = build_queue(args.confidence, args.drift, args.max)
+        if not bundles:
+            print("✓ No sections need Claude review (all above confidence + below drift).")
+            return 0
+        print(f"✓ Built {len(bundles)} review bundle(s) under {REVIEW_DIR}")
+        for b in bundles:
+            print(f"  • {Path(b['_path']).name}  reason={b.get('reason')}  "
+                  f"kind={b.get('section_kind')}")
+        return 0
+
+    ap.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -74,12 +74,20 @@ Bash — no separate Python setup script is involved.
      "primary_menu_location": "menu-1",
      "footer_menu_name": "Footer Menu",
      "footer_menu_location": "menu-2",
+     "footer_menus": [],
      "fonts": [],
      "forms": [],
      "custom_post_types": []
    }
    ```
    `chmod 600` after writing.
+
+   `footer_menus` is an optional list — `[{name, location}, ...]` —
+   that lets a developer override the auto-generated names/locations
+   the agent assigns to each detected footer link column. Leave empty
+   to accept `Footer Column 1..N` with location slugs `footer-col-1..N`.
+   The orchestrator validates location slugs against the active theme's
+   registered nav-menu slots at runtime and remaps if a slug doesn't exist.
 9. **Verify the bridge.** GET `<wp_url>/wp-json/figma-importer/v1/health`.
    Expect `{"ok": true}`. If it 404s, the most common cause is permalinks
    set to "Plain" — tell the developer to switch to "Post name" and stop.
@@ -144,11 +152,38 @@ When invoked with `start [free-form instructions]`:
    "no confirmations" in the free-form instruction.
 6. Run **Phases C → F** by invoking the appropriate sub-agents (or the
    single end-to-end importer in `scripts/import_elementor.py`, which is
-   usually faster).
-7. Run **Phase G** (`visual-reviewer`).
-8. If drift > threshold → run **Phase H** (`auto-fixer`) up to 3 iterations,
-   re-running G between each.
-9. Print final summary with live URL, edit URL, and remaining drift.
+   usually faster). The importer enforces the **Theme Builder gate** by
+   default — if header + footer cannot be detected as Theme Builder
+   templates the build aborts with exit code 7. If that happens, add
+   `header_pattern` / `footer_pattern` overrides to `project-config.json`
+   and re-run.
+7. **Claude-as-Author dispatch** (between F and G). Before declaring
+   the build done, run `python3 scripts/claude_review.py --build`. For
+   every bundle it produces under `build/claude-review/`, use the
+   **Agent** tool to dispatch a sub-agent with the bundle contents and
+   the `instructions` field as the prompt. Apply each result through
+   `scripts/patch_elementor.py` (for `patches`) or by editing
+   `build/data.json` then re-running `import_elementor.py --replay`
+   (for `replace_subtree`). Cap at 5 dispatches per build.
+8. Run **Phase G** (`visual-reviewer`) — multi-breakpoint by default
+   (desktop + tablet + mobile via the rewritten `visual_compare.py`).
+9. If drift > threshold → run **Phase H** (`auto-fixer`) up to 3 iterations,
+   re-running G between each. The auto-fixer now escalates any region
+   with `drift > 15%` to Claude review instead of patching padding.
+10. **Quality gate** (mandatory). Run:
+    ```bash
+    python3 scripts/verify_quality.py --drift-threshold 0.05 --min-global-coverage 0.7
+    ```
+    If it exits non-zero you MUST NOT print `✓ Build complete`. Print
+    `✗ Build FAILED — see verify_quality output above` with the failing
+    checks listed verbatim, then surface the edit URL so the developer
+    can fix the offending sections by hand. The gate checks:
+      * desktop drift ≤ 5% (configurable)
+      * tablet and mobile drift ≤ 5% when baselines exist
+      * `manual_review_regions` is empty
+      * `header` AND `footer` placements exist
+      * global color coverage ≥ 70% AND typography coverage ≥ 70%
+11. Print final summary with live URL, edit URL, and remaining drift.
 
 When invoked with one of `globals|header|footer|page|review|fix`, run only
 that phase (skipping A is OK only if the agent already authenticated this
@@ -157,7 +192,11 @@ session; otherwise re-run A first).
 ## Skills to load
 
 - `elementor-rest` — REST + bridge endpoints
-- `elementor-data-schema` — element tree shape
+- `elementor-data-schema` — element tree shape (5 core widgets in depth)
+- `elementor-widgets` — full catalog of Free Basic + Pro general widgets
+  (detection signals, min JSON, common settings, Pro fallbacks). Consult
+  BEFORE inventing a container + text + image fallback for any unmatched
+  Figma section.
 - `global-styles-mapping` — global.json → kit settings
 - `asset-pipeline` — uploads + URL rewrites
 - `theme-builder` — header/footer detection + Pro vs Free
@@ -239,6 +278,19 @@ Use sub-agents when:
 - **Never** swallow REST errors silently — print response body.
 - **Never** ask the developer to run `pip` or `npm` themselves — the
   bootstrap installs deps automatically.
+- **Never** print `✓ Build complete` while `verify_quality.py` exits
+  non-zero. The quality gate is mandatory; pass it or report `✗ FAILED`
+  with the failing checks listed.
+- **Never** trust the plugin export blindly — `_figma_section_purpose`
+  at confidence < 0.6 is a *hint*, not a fact. The agent's own
+  geometric / structural / name analysis is allowed to outrank it.
+- **Never** pass `--reset-media` or `--reset-menus` without an explicit
+  `--confirm-destructive` flag and a confirmation prompt to the
+  developer — these wipe agent-uploaded assets / menu items.
 - **Always** save `build/state.json` after each phase so re-entry is cheap.
 - **Always** stop the auto-fix loop after 3 iterations even if drift remains.
-- **Always** end with the live URL and edit URL printed.
+- **Always** dispatch Claude-as-Author for sections with confidence < 0.6
+  or live-vs-expected drift > 15%, rather than surrendering to a
+  screenshot fallback. Cap at 5 dispatches per build.
+- **Always** end with the live URL and edit URL printed (alongside the
+  gate verdict — PASS or FAIL).

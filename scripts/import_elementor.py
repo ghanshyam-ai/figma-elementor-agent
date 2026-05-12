@@ -181,57 +181,211 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9_-]+", "_", s.lower()).strip("_") or "x"
 
 
+# ---------- Brand-color heuristics ----------
+#
+# The plugin sorts colors by raw usage count, which means a grey wall
+# fill (used as background on every section) wins the "primary" slot.
+# That cascades into widgets binding `title_color → grey`. To fix this
+# we score each color on:
+#   • saturation        (greys score 0; neon brand colors score high)
+#   • not-near-grey     (white/black/grey can't be a brand color)
+#   • usage context     (buttonBg + textHeading hits beat raw count)
+#   • role hint         (plugin's own roleHint when meaningful)
+
+def _hex_to_rgb(hex_v: str) -> tuple[int, int, int] | None:
+    s = hex_v.strip().lstrip("#")
+    if len(s) not in (3, 6, 8):
+        return None
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    try:
+        return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        return None
+
+
+def _saturation(rgb: tuple[int, int, int]) -> float:
+    r, g, b = rgb
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx == 0:
+        return 0.0
+    return (mx - mn) / mx
+
+
+def _luminance(rgb: tuple[int, int, int]) -> float:
+    r, g, b = (v / 255.0 for v in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _is_near_grey(rgb: tuple[int, int, int]) -> bool:
+    """Pure white, pure black, and any color with saturation < 0.10 → grey."""
+    if _saturation(rgb) < 0.10:
+        return True
+    return False
+
+
+def _is_near_white(rgb: tuple[int, int, int]) -> bool:
+    return min(rgb) > 240
+
+
+def _is_near_black(rgb: tuple[int, int, int]) -> bool:
+    return max(rgb) < 30
+
+
+def _brand_score(c: dict) -> float:
+    """Score how likely this color is a brand-primary candidate.
+
+    Higher = more likely a brand color. Greys/whites/blacks score near 0
+    even if heavily used.
+    """
+    rgb = _hex_to_rgb(c.get("value", ""))
+    if not rgb:
+        return 0.0
+    if _is_near_grey(rgb) or _is_near_white(rgb) or _is_near_black(rgb):
+        return 0.0
+    sat = _saturation(rgb)
+    ctx = c.get("usageContext") or {}
+    btn_hits = (ctx.get("buttonBg") or 0) + (ctx.get("buttonText") or 0)
+    heading_hits = ctx.get("textHeading") or 0
+    # Saturation dominates. Button + heading usage are tie-breakers.
+    return sat * 100 + btn_hits * 2 + heading_hits * 1
+
+
+def _surface_score(c: dict) -> float:
+    """Score how likely this color is a section surface (background)."""
+    rgb = _hex_to_rgb(c.get("value", ""))
+    if not rgb:
+        return 0.0
+    ctx = c.get("usageContext") or {}
+    return float(ctx.get("surface") or 0) + (50 if _is_near_white(rgb) else 0)
+
+
+def _text_score(c: dict) -> float:
+    """Score how likely this color is the default text color."""
+    rgb = _hex_to_rgb(c.get("value", ""))
+    if not rgb:
+        return 0.0
+    ctx = c.get("usageContext") or {}
+    # Dark, low-saturation colors with heavy body-text usage win.
+    return (
+        (ctx.get("textBody") or 0) * 3
+        + (ctx.get("textHeading") or 0) * 2
+        + (50 if _is_near_black(rgb) else 0)
+        + (1.0 - _luminance(rgb)) * 30
+    )
+
+
+def _pick_brand_colors(colors: list[dict]) -> dict[str, dict]:
+    """Choose the four system_colors slots — primary, secondary, text, accent.
+
+    Returns {slot: color_dict_with_index}. Slots are filled by score, not
+    by plugin declaration order. Greys/whites can never claim brand slots
+    but can still claim `text` (when they're the darkest entry).
+    """
+    if not colors:
+        return {}
+
+    # primary = highest brand score
+    brand_ranked = sorted(
+        ((c, _brand_score(c)) for c in colors), key=lambda x: -x[1]
+    )
+    brand_candidates = [c for c, score in brand_ranked if score > 0]
+
+    # text = highest text score
+    text_ranked = sorted(
+        ((c, _text_score(c)) for c in colors), key=lambda x: -x[1]
+    )
+    text_candidates = [c for c, score in text_ranked if score > 0]
+
+    slots: dict[str, dict] = {}
+    used_ids: set[int] = set()
+
+    def claim(slot: str, candidates: list[dict]) -> None:
+        for c in candidates:
+            if id(c) in used_ids:
+                continue
+            slots[slot] = c
+            used_ids.add(id(c))
+            return
+
+    claim("primary", brand_candidates)
+    claim("secondary", brand_candidates)  # second-best brand color
+    claim("text", text_candidates)
+    claim("accent", brand_candidates)     # third-best brand color
+    # Fill remaining slots from anything left, in original order.
+    for slot in SYSTEM_COLOR_SLUGS:
+        if slot in slots:
+            continue
+        for c in colors:
+            if id(c) in used_ids:
+                continue
+            slots[slot] = c
+            used_ids.add(id(c))
+            break
+    return slots
+
+
 def map_global_to_kit_settings(global_json: dict) -> dict:
     colors = list(global_json.get("colors", []))
     typography = list(global_json.get("typography", []))
 
+    # Brand-aware slot assignment instead of declaration order.
+    slot_map = _pick_brand_colors(colors)
     system_colors: list[dict] = []
-    remaining_slots = list(SYSTEM_COLOR_SLUGS)
-    # First pass: claim slots for colors whose name matches a canonical slug.
-    claimed: dict[int, str] = {}
-    for idx, c in enumerate(colors[:4]):
-        name = c.get("name", "")
-        if name in remaining_slots:
-            claimed[idx] = name
-            remaining_slots.remove(name)
-    # Second pass: assign remaining canonical slots in order.
-    for idx, c in enumerate(colors[:4]):
-        if idx in claimed:
-            slug = claimed[idx]
-        else:
-            slug = remaining_slots.pop(0) if remaining_slots else _slug(c.get("name", f"c{idx}"))
+    system_color_ids: set[int] = set()
+    for slug in SYSTEM_COLOR_SLUGS:
+        c = slot_map.get(slug)
+        if not c:
+            continue
         title = (c.get("name") or slug).title()
         system_colors.append({"_id": slug, "title": title, "color": c["value"]})
+        system_color_ids.add(id(c))
 
     custom_colors: list[dict] = []
-    for c in colors[4:]:
+    for c in colors:
+        if id(c) in system_color_ids:
+            continue
         h = hashlib.md5(c["value"].encode()).hexdigest()[:7]
-        custom_colors.append({"_id": h, "title": c["name"], "color": c["value"]})
+        custom_colors.append({"_id": h, "title": c.get("name") or h, "color": c["value"]})
 
-    # System typography — first instance per name slot
-    seen: set[str] = set()
-    system_typography: list[dict] = []
+    # System typography — pick the *largest* size per slot name so e.g.
+    # the three "h2" entries (sizes 30.7, 25, 31) collapse to the largest.
+    # Also: skip entries with no fontFamily so we don't ship null-family
+    # presets that no widget will ever match.
+    by_slot: dict[str, dict] = {}
     primary_font: str | None = None
+    VALID_SLOTS = ("display", "h1", "h2", "h3", "h4", "body", "small", "caption", "caption-strong")
     for t in typography:
         name = t.get("name") or ""
-        if name in seen:
+        if name not in VALID_SLOTS:
             continue
-        if name not in ("display", "h1", "h2", "h3", "h4", "body", "small", "caption", "caption-strong"):
+        if not t.get("fontFamily"):
             continue
-        seen.add(name)
+        size_v = t.get("fontSize") or 0
+        existing = by_slot.get(name)
+        if existing and (existing.get("fontSize") or 0) >= size_v:
+            continue
+        by_slot[name] = t
+
+    system_typography: list[dict] = []
+    for name, t in by_slot.items():
         ts: dict = {
             "_id": _slug(name),
             "title": name.title(),
             "typography_typography": "custom",
         }
         ff = t.get("fontFamily")
-        if ff:
-            ts["typography_font_family"] = ff
-            primary_font = primary_font or ff
+        ts["typography_font_family"] = ff
+        primary_font = primary_font or ff
         if t.get("fontWeight"):
             ts["typography_font_weight"] = str(int(t["fontWeight"]))
-        if t.get("fontSize"):
-            ts["typography_font_size"] = {"unit": "px", "size": float(t["fontSize"]), "sizes": []}
+        size_v = t.get("fontSize")
+        if isinstance(size_v, (int, float)):
+            ts["typography_font_size"] = {
+                "unit": "px",
+                "size": float(round(size_v)),  # round fractional Figma sizes
+                "sizes": [],
+            }
         lh = t.get("lineHeight")
         if isinstance(lh, (int, float)):
             ts["typography_line_height"] = {"unit": "px", "size": float(lh), "sizes": []}
@@ -256,6 +410,72 @@ def map_global_to_kit_settings(global_json: dict) -> dict:
             "sizes": [],
         }
     return settings
+
+
+# ---------- Globalization verification ----------
+
+def verify_globalization(content: list, kit_settings: dict) -> dict:
+    """Compute coverage = (widget refs to globals) / (widget refs total).
+
+    Returns {"colors": 0.0..1.0, "typography": 0.0..1.0, "details": {...}}.
+    Used by the orchestrator's quality gate — when coverage is < 0.7 the
+    build is flagged because most widgets still hold inline values.
+    """
+    from optimize import COLOR_KEYS_BY_WIDGET, CONTAINER_COLOR_KEYS, ADVANCED_COLOR_KEYS
+
+    total_color_refs = 0
+    resolved_color_refs = 0
+    total_type_refs = 0
+    resolved_type_refs = 0
+
+    HEX_RE = re.compile(r"^#?[0-9a-fA-F]{3,8}$")
+
+    def is_hex(v) -> bool:
+        return isinstance(v, str) and bool(HEX_RE.match(v.strip()))
+
+    def visit(n: dict) -> None:
+        nonlocal total_color_refs, resolved_color_refs, total_type_refs, resolved_type_refs
+        if not isinstance(n, dict):
+            return
+        s = n.get("settings") or {}
+        globals_ref = s.get("__globals__") or {}
+
+        if n.get("elType") == "container":
+            keys = CONTAINER_COLOR_KEYS
+        else:
+            keys = COLOR_KEYS_BY_WIDGET.get(n.get("widgetType"), []) + ADVANCED_COLOR_KEYS
+
+        for k in keys:
+            v = s.get(k)
+            if is_hex(v):
+                total_color_refs += 1
+            elif k in globals_ref:
+                total_color_refs += 1
+                resolved_color_refs += 1
+
+        # Typography: any widget with typography_font_family set is a ref.
+        if isinstance(s.get("typography_font_family"), str) and s["typography_font_family"]:
+            total_type_refs += 1
+        if s.get("typography_typography") == "globals" or "typography_typography" in globals_ref:
+            total_type_refs += 1
+            resolved_type_refs += 1
+
+        for c in n.get("elements") or []:
+            visit(c)
+
+    for top in content:
+        visit(top)
+
+    return {
+        "colors": (resolved_color_refs / total_color_refs) if total_color_refs else 1.0,
+        "typography": (resolved_type_refs / total_type_refs) if total_type_refs else 1.0,
+        "details": {
+            "total_color_refs": total_color_refs,
+            "resolved_color_refs": resolved_color_refs,
+            "total_type_refs": total_type_refs,
+            "resolved_type_refs": resolved_type_refs,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -310,13 +530,39 @@ def remove_node_by_id(content: list, target_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def build_default_menu_items(slug_to_url: dict[str, str]) -> list[dict]:
-    """Generate placeholder menu items. If we already created pages, link to them;
-    otherwise use # placeholders the developer can wire up later in wp-admin → Menus."""
+    """Generate placeholder menu items. Used ONLY as a last resort when the
+    design contains zero parseable nav links (e.g. footer columns baked
+    into a single image)."""
     items = []
     for label, slug in (("Home", "home"), ("About", "about"), ("Services", "services"),
                        ("Blog", "blog"), ("Contact", "contact")):
         url = slug_to_url.get(slug, "#")
         items.append({"title": label, "url": url})
+    return items
+
+
+def extract_nav_items_from_sections(sections: list, kind: str) -> list[dict]:
+    """Walk all sections of `kind` (header / footer / footer-column) and
+    produce a deduped list of `{title, url}` items from the contained
+    text/button widgets.
+
+    Returns an empty list when the design has nothing parseable — caller
+    decides whether to fall back to placeholders or dispatch Claude to OCR
+    the section image.
+    """
+    from section_finder import extract_nav_items as _extract
+    seen: set[str] = set()
+    items: list[dict] = []
+    for s in sections:
+        if s.kind != kind:
+            continue
+        for it in _extract(s):
+            key = (it["title"].lower().strip(), it.get("url", "").lower().strip())
+            stable = key[0] + "|" + key[1]
+            if stable in seen:
+                continue
+            seen.add(stable)
+            items.append(it)
     return items
 
 
@@ -384,6 +630,23 @@ def inject_nav_menu_into_template(template_node: dict, menu_widget: dict) -> boo
     return True
 
 
+def _collect_node_ids(content) -> list[str]:
+    """Pre-order traversal of element ids — used to align pre- and post-
+    regen node identities by index."""
+    out: list[str] = []
+    def walk(n):
+        if isinstance(n, dict):
+            if n.get("id"):
+                out.append(n["id"])
+            for c in n.get("elements") or []:
+                walk(c)
+        elif isinstance(n, list):
+            for it in n:
+                walk(it)
+    walk(content)
+    return out
+
+
 def widget_stats(content: list) -> dict:
     stats = {"containers": 0, "widgets_total": 0, "widgets": {}}
 
@@ -440,15 +703,33 @@ def main() -> int:
                     help="Don't replace low-confidence sections with screenshot images.")
     ap.add_argument("--max-depth", type=int, default=6,
                     help="Maximum container nesting depth (default: 6).")
-    ap.add_argument("--low-confidence-threshold", type=float, default=0.5,
-                    help="Sections below this confidence get screenshot fallback (default: 0.5).")
+    ap.add_argument("--low-confidence-threshold", type=float, default=0.3,
+                    help="Sections below this confidence get screenshot fallback (default: 0.3). "
+                         "Lowered from 0.5 in the previous revision — the agent now dispatches "
+                         "Claude-as-Author for marginal sections instead of surrendering to a screenshot.")
     ap.add_argument("--page-only", action="store_true",
                     help="Page-by-page mode: skip globals + header/footer + design tokens. "
                          "Use this for the 2nd, 3rd, … page after the home page already created them.")
     ap.add_argument("--reset-media", action="store_true",
                     help="Before uploading, delete agent-uploaded attachments from prior runs "
-                         "(matches by figma-export filename prefix). Destructive — confirm first.")
+                         "(matches by figma-export filename prefix). Destructive — requires --confirm-destructive.")
+    ap.add_argument("--confirm-destructive", action="store_true",
+                    help="Acknowledge that destructive operations (--reset-media, --reset-menus) "
+                         "are intentional. Without this flag, destructive operations abort.")
+    ap.add_argument("--require-theme-builder", action="store_true", default=True,
+                    help="Fail if header AND footer aren't detected as Theme Builder templates. "
+                         "Default ON — pass --no-require-theme-builder for partial builds.")
+    ap.add_argument("--no-require-theme-builder", dest="require_theme_builder",
+                    action="store_false")
+    ap.add_argument("--skip-responsive-defaults", action="store_true",
+                    help="Don't stamp _mobile / _tablet overrides on containers + headings.")
     args = ap.parse_args()
+
+    # --- Safety gate for destructive flags --------------------------------
+    if (args.reset_media or args.reset_menus) and not args.confirm_destructive:
+        print("✗ --reset-media / --reset-menus are destructive. Re-run with --confirm-destructive "
+              "if this is intentional.", file=sys.stderr)
+        return 6
 
     if args.only_globals:
         args.skip_header_footer = True
@@ -645,11 +926,28 @@ def main() -> int:
     except ImportError:
         _crop_sections = None  # PIL missing; fallback path will skip crops
 
+    # --- Drop hidden / zero-opacity layers --------------------------------
+    # Defensive filter: real-world Figma files leave hidden variant frames
+    # and invisible decorations behind. The plugin sometimes leaks them
+    # through; we never want them rendering on the live page.
+    from section_finder import filter_hidden as _filter_hidden
+    n_hidden = _filter_hidden(content)
+    if n_hidden:
+        print(f"  filtered {n_hidden} hidden / zero-opacity node(s) from page tree")
+
     # --- Recursive section finder (any depth) ----------------------------
     # Replaces the top-level-only architecture routing that broke on
     # designs wrapped in a single root frame.
-    from section_finder import find_real_sections, by_kind as sf_by_kind, summarize as sf_summary, detach as sf_detach
+    from section_finder import (
+        find_real_sections, by_kind as sf_by_kind, summarize as sf_summary,
+        detach as sf_detach, extract_footer_columns,
+    )
     real_sections = find_real_sections(content, enrichment.section_by_index)
+
+    # Augment with detected footer columns (each becomes its own nav menu).
+    for footer_sec in [s for s in real_sections if s.kind == "footer"]:
+        real_sections.extend(extract_footer_columns(footer_sec))
+
     structural_node_ids = {id(s.elementor_node) for s in real_sections}
     if real_sections:
         print(f"✓ Sections found (any depth): " + ", ".join(
@@ -669,11 +967,31 @@ def main() -> int:
         except Exception as exc:
             print(f"  (skipped section crops: {exc})")
 
+    # --- Confidence + screenshot fallbacks (BEFORE widget swaps) ---------
+    # Runs first so widget-inference doesn't waste effort mutating sections
+    # we're about to replace wholesale. Audit caught this ordering bug.
+    from validation_layer import compute_report, apply_screenshot_fallbacks
+    fallback_indices: list[int] = []
+    if not args.skip_fallbacks:
+        if args.dry_run:
+            from enrich import low_confidence_node_ids
+            low = low_confidence_node_ids(enrichment, args.low_confidence_threshold)
+            if low:
+                print(f"  [dry] would replace {len(low)} low-confidence section(s) with screenshot fallback")
+        else:
+            fallback_indices = apply_screenshot_fallbacks(
+                content, enrichment, export_dir, screenshot_map,
+                threshold=args.low_confidence_threshold,
+            )
+            if fallback_indices:
+                print(f"  fallback: {len(fallback_indices)} low-confidence section(s) replaced with screenshot")
+
     # --- Token resolver + optimization passes ----------------------------
     optimize_stats = {"colors": 0, "typography": 0, "collapsed": 0, "hoisted": 0,
                       "widgets_swapped": 0, "html_replaced": 0,
                       "radius_tagged": 0, "gap_tagged": 0,
-                      "auto_layout_inferred": 0, "widgets_inferred": 0}
+                      "auto_layout_inferred": 0, "widgets_inferred": 0,
+                      "responsive_containers": 0, "responsive_headings": 0}
     if not args.skip_optimize:
         from optimize import (
             resolve_global_tokens, collapse_single_child_containers,
@@ -711,6 +1029,14 @@ def main() -> int:
             content, protected_ids=structural_node_ids,
         )
         optimize_stats["hoisted"] = cap_nesting_depth(content, args.max_depth)
+        # Responsive defaults — stamp `_mobile` / `_tablet` overrides so the
+        # page actually stacks on small screens. Elementor reads these
+        # natively; without them the page renders horizontal on mobile.
+        if not args.skip_responsive_defaults:
+            from optimize import apply_responsive_defaults
+            rstats = apply_responsive_defaults(content)
+            optimize_stats["responsive_containers"] = rstats["containers"]
+            optimize_stats["responsive_headings"] = rstats["headings"]
         print(
             f"✓ Optimize: {optimize_stats['colors']} colors→globals, "
             f"{optimize_stats['typography']} typo→globals, "
@@ -718,25 +1044,22 @@ def main() -> int:
             f"{optimize_stats['collapsed']} containers collapsed, "
             f"{optimize_stats['hoisted']} hoisted (depth≤{args.max_depth}), "
             f"{optimize_stats['widgets_swapped']} widgets swapped, "
-            f"{optimize_stats['html_replaced']} html→text-editor"
+            f"{optimize_stats['html_replaced']} html→text-editor, "
+            f"{optimize_stats['responsive_containers']} containers got _mobile defaults"
         )
 
-    # --- Confidence + screenshot fallbacks -------------------------------
-    from validation_layer import compute_report, apply_screenshot_fallbacks
-    fallback_indices: list[int] = []
-    if not args.skip_fallbacks:
-        if args.dry_run:
-            from enrich import low_confidence_node_ids
-            low = low_confidence_node_ids(enrichment, args.low_confidence_threshold)
-            if low:
-                print(f"  [dry] would replace {len(low)} low-confidence section(s) with screenshot fallback")
-        else:
-            fallback_indices = apply_screenshot_fallbacks(
-                content, enrichment, export_dir, screenshot_map,
-                threshold=args.low_confidence_threshold,
-            )
-            if fallback_indices:
-                print(f"  fallback: {len(fallback_indices)} low-confidence section(s) replaced with screenshot")
+    # --- Globalization coverage check (gate-friendly) ---------------------
+    global_coverage: dict = {"colors": 1.0, "typography": 1.0, "details": {}}
+    if page_settings:
+        global_coverage = verify_globalization(content, page_settings)
+        print(
+            f"  global coverage: colors={global_coverage['colors']*100:.1f}%, "
+            f"typography={global_coverage['typography']*100:.1f}% "
+            f"(refs: colors {global_coverage['details']['resolved_color_refs']}/"
+            f"{global_coverage['details']['total_color_refs']}, "
+            f"typo {global_coverage['details']['resolved_type_refs']}/"
+            f"{global_coverage['details']['total_type_refs']})"
+        )
 
     # --- Dynamic content (Posts widget for blog grids) -------------------
     has_pro = bool(health.get("elementor_pro")) if not args.dry_run else False
@@ -749,28 +1072,86 @@ def main() -> int:
         print(f"✓ Dynamic: {n} blog-grid section(s) → {kind}")
 
     # --- Menus ------------------------------------------------------------
+    # Real menu items from the Figma design first; placeholders only as a
+    # last resort. Footer columns each get their OWN menu so we don't
+    # collapse 4 columns of links into one Primary Menu.
     primary_menu_info = footer_menu_info = None
+    footer_column_menus: list[dict] = []
     if not args.skip_menus:
         primary_name = cfg.get("primary_menu_name", "Primary Menu")
         primary_loc  = cfg.get("primary_menu_location", "menu-1")
         footer_name  = cfg.get("footer_menu_name", "Footer Menu")
         footer_loc   = cfg.get("footer_menu_location", "menu-2")
+
+        # Validate location slugs against what the active theme actually
+        # registers — without this the agent silently binds menus to slots
+        # that don't exist on themes other than hello-elementor.
+        if not args.dry_run:
+            theme_locs = client.list_theme_nav_locations() or []
+            registered_slugs = {l.get("slug") for l in theme_locs}
+            if registered_slugs:
+                def _resolve(preferred: str, *aliases: str) -> str:
+                    for s in (preferred, *aliases):
+                        if s in registered_slugs:
+                            return s
+                    # Pick the first registered slug as a sensible fallback.
+                    return sorted(registered_slugs)[0]
+                primary_loc = _resolve(primary_loc, "primary", "menu-1", "main-menu")
+                footer_loc  = _resolve(footer_loc, "footer", "menu-2", "secondary")
+                if primary_loc != cfg.get("primary_menu_location", "menu-1"):
+                    print(f"  ↪ primary menu location remapped to '{primary_loc}' "
+                          f"(theme registers: {sorted(registered_slugs)})")
         slug_to_url = {cfg.get("page_slug", "home"):
                        f"{cfg['wp_url'].rstrip('/')}/{cfg.get('page_slug', 'home')}/"}
-        items = build_default_menu_items(slug_to_url)
+
+        primary_items = extract_nav_items_from_sections(real_sections, "header")
+        if not primary_items:
+            primary_items = build_default_menu_items(slug_to_url)
+            print("  (no parseable nav items in header — using placeholders)")
+        else:
+            print(f"  extracted {len(primary_items)} nav item(s) from header section(s)")
+
+        footer_items = extract_nav_items_from_sections(real_sections, "footer-column")
+        if not footer_items:
+            # Fall back to anything in the footer at all (text/buttons).
+            footer_items = extract_nav_items_from_sections(real_sections, "footer")
+        if not footer_items:
+            footer_items = build_default_menu_items(slug_to_url)
+            print("  (no parseable nav items in footer — using placeholders)")
+
+        # Build per-column menu specs.
+        footer_cols = [s for s in real_sections if s.kind == "footer-column"]
+        configured_cols = cfg.get("footer_menus") or []  # optional dev override
+        column_specs: list[dict] = []
+        for i, col in enumerate(footer_cols, start=1):
+            from section_finder import extract_nav_items as _extract
+            col_items = _extract(col)
+            if not col_items:
+                continue
+            spec = {
+                "name": (configured_cols[i - 1].get("name") if i - 1 < len(configured_cols) and isinstance(configured_cols[i - 1], dict) else None)
+                        or f"Footer Column {i}",
+                "location": (configured_cols[i - 1].get("location") if i - 1 < len(configured_cols) and isinstance(configured_cols[i - 1], dict) else None)
+                            or f"footer-col-{i}",
+                "items": col_items,
+            }
+            column_specs.append(spec)
 
         if args.dry_run:
             print(f"  [dry] would create/update menus: '{primary_name}' (location={primary_loc}) "
-                  f"and '{footer_name}' (location={footer_loc}) with {len(items)} placeholder items each")
-            primary_menu_info = {"slug": "primary-menu"}
-            footer_menu_info  = {"slug": "footer-menu"}
+                  f"with {len(primary_items)} items, '{footer_name}' (location={footer_loc}) "
+                  f"with {len(footer_items)} items, plus {len(column_specs)} footer-column menus")
+            primary_menu_info = {"slug": "primary-menu", "id": 0, "item_count": len(primary_items), "created": True}
+            footer_menu_info  = {"slug": "footer-menu", "id": 0, "item_count": len(footer_items), "created": True}
+            footer_column_menus = [{"slug": s["location"], **s, "id": 0, "item_count": len(s["items"]), "created": True}
+                                    for s in column_specs]
         else:
             print(f"→ Create/update WP menus")
             primary_menu_info = client.create_or_update_menu(
-                name=primary_name, location=primary_loc, items=items, reset=args.reset_menus
+                name=primary_name, location=primary_loc, items=primary_items, reset=args.reset_menus,
             )
             footer_menu_info = client.create_or_update_menu(
-                name=footer_name, location=footer_loc, items=items, reset=args.reset_menus
+                name=footer_name, location=footer_loc, items=footer_items, reset=args.reset_menus,
             )
             print(f"✓ {primary_name}  id={primary_menu_info['id']}  slug={primary_menu_info['slug']}  "
                   f"items={primary_menu_info['item_count']}  "
@@ -778,6 +1159,15 @@ def main() -> int:
             print(f"✓ {footer_name}   id={footer_menu_info['id']}  slug={footer_menu_info['slug']}  "
                   f"items={footer_menu_info['item_count']}  "
                   f"({'created' if footer_menu_info['created'] else 'existing'})")
+            for spec in column_specs:
+                info = client.create_or_update_menu(
+                    name=spec["name"], location=spec["location"], items=spec["items"],
+                    reset=args.reset_menus,
+                )
+                footer_column_menus.append({**info, "name": spec["name"], "location": spec["location"]})
+                print(f"✓ {spec['name']}  id={info['id']}  slug={info['slug']}  "
+                      f"items={info['item_count']}  "
+                      f"({'created' if info['created'] else 'existing'})")
 
     # --- Form intelligence (Gravity Forms) -------------------------------
     form_results: list[dict] = []
@@ -823,6 +1213,30 @@ def main() -> int:
     else:
         print("  (no header/footer/popup/archive/single/search/404 sections detected)")
 
+    # --- Theme Builder assertion gate ------------------------------------
+    # If --require-theme-builder is on (default), the build must produce a
+    # header AND footer template — otherwise they'll render inline on the
+    # page, which is exactly what the user explicitly wants to prevent.
+    # Print the failing reason and instruct the developer how to fix it
+    # in project-config.json before re-running. Honour --skip-header-footer
+    # (which says "I know what I'm doing, don't enforce this gate").
+    if args.require_theme_builder and not args.skip_header_footer and not args.page_only:
+        has_header = bool(by_kind(placements, "header"))
+        has_footer = bool(by_kind(placements, "footer"))
+        if not (has_header and has_footer):
+            missing = []
+            if not has_header: missing.append("header")
+            if not has_footer: missing.append("footer")
+            print(f"\n✗ Theme Builder gate FAILED — could not detect {' and '.join(missing)} section(s).")
+            print( "  The agent will not silently fall through to inline header/footer because")
+            print( "  the user requirement is that they MUST be Theme Builder templates.")
+            print(f"  Fix options:")
+            print(f"    1. Improve the Figma layer name to match the patterns in")
+            print(f"       section_finder.NAME_RX (e.g. \"Header\", \"Navbar\", \"Footer\", \"Site Footer\").")
+            print(f"    2. Set `header_pattern` / `footer_pattern` regex overrides in project-config.json.")
+            print(f"    3. Re-run with --no-require-theme-builder to allow inline header/footer (not recommended).")
+            return 7
+
     # Header / Footer / Popup / Archive / Single / Search / 404 — by placements
     if not args.skip_header_footer:
         for p in by_kind(placements, "header"):
@@ -835,6 +1249,7 @@ def main() -> int:
                 p, client, args, data, kind="footer", is_pro=is_pro,
                 menu_info=footer_menu_info, menu_layout="horizontal",
                 project_state=project_state,
+                footer_column_menus=footer_column_menus,
             )
         for kind in ("popup", "archive", "single", "search", "404"):
             for p in by_kind(placements, kind):
@@ -923,6 +1338,10 @@ def main() -> int:
         if args.dry_run:
             print(f"  [dry] would create page with {len(page_only)} top-level container(s)")
         else:
+            # Snapshot pre-regen ids so we can rebuild the post-regen id_map
+            # by walking the bridge's response in the same tree order.
+            pre_regen_ids = _collect_node_ids(page_only)
+
             r = client.create_or_update_page(
                 slug=slug,
                 title=title,
@@ -935,16 +1354,35 @@ def main() -> int:
             print(f"  edit: {r['edit_url']}")
             project_state.record_page(slug, r["id"], r["permalink"])
 
+            # Read back the post-regen tree and build {pre_id → post_id}
+            # so auto-fixer / claude-review can reference nodes by stable id
+            # across the iterate_data regen barrier.
+            try:
+                live_tree = client.get_elementor_data(r["id"])
+                post_regen_ids = _collect_node_ids(live_tree)
+                id_map = {pre: post for pre, post in zip(pre_regen_ids, post_regen_ids)}
+                (build_dir / "id_map.json").write_text(json.dumps(id_map, indent=2))
+                print(f"  + persisted id_map for {len(id_map)} node(s) → build/id_map.json")
+            except Exception as exc:
+                print(f"  (could not build id_map: {exc})")
+
             # Warm Elementor's CSS cache: visit the page so Elementor compiles
             # per-element CSS files. Without this, the first Playwright capture
             # often shows an unstyled page (huge false drift).
             try:
                 import time
                 print("→ Warm Elementor CSS cache (GET page twice)…", end=" ", flush=True)
-                client.session.get(r["permalink"], timeout=30)
+                resp1 = client.session.get(r["permalink"], timeout=30)
                 time.sleep(2)
-                client.session.get(r["permalink"], timeout=30)
-                print("done")
+                resp2 = client.session.get(r["permalink"], timeout=30)
+                if resp1.status_code >= 400 or resp2.status_code >= 400:
+                    # Don't silently swallow — a 404 here means the page is
+                    # private/draft or the permalink is wrong; the visual
+                    # review will then fail in confusing ways.
+                    print(f"warning: status={resp1.status_code}/{resp2.status_code} — "
+                          "page may be unpublished or behind auth")
+                else:
+                    print("done")
             except Exception as exc:  # network hiccup is non-fatal
                 print(f"skipped ({exc})")
 
@@ -973,9 +1411,28 @@ def main() -> int:
         "dynamic_count": len(dyn_candidates),
         "form_results": form_results,
         "placements_summary": arch_summary(placements) if placements else {},
+        "kit_globals": {
+            "system_colors": (page_settings or {}).get("system_colors") or [],
+            "system_typography": (page_settings or {}).get("system_typography") or [],
+        },
+        "footer_column_menus": footer_column_menus,
+        "primary_menu": primary_menu_info or {},
+        "footer_menu": footer_menu_info or {},
     }
     (build_dir / "state.json").write_text(json.dumps(state, indent=2, default=str))
-    (build_dir / "import-report.json").write_text(json.dumps(report.to_dict(), indent=2))
+
+    # Attach global coverage to import-report so the quality gate can read it.
+    report_dict = report.to_dict()
+    report_dict["global_coverage"] = {
+        "colors": round(global_coverage["colors"], 3),
+        "typography": round(global_coverage["typography"], 3),
+        "details": global_coverage.get("details", {}),
+    }
+    (build_dir / "import-report.json").write_text(json.dumps(report_dict, indent=2))
+
+    # Save the rewritten `content` so claude_review.py can read the
+    # current Elementor tree without going back to the live WP site.
+    (build_dir / "data.json").write_text(json.dumps({"content": content}, indent=2, default=str))
 
     # Persist cross-run project state (kit + templates + forms + assets +
     # imported pages) so the next page-by-page run can auto-skip work.
@@ -1028,6 +1485,7 @@ def _create_template_from_placement(
     menu_info=None,
     menu_layout: str = "vertical",
     project_state=None,
+    footer_column_menus: list | None = None,
 ):
     """Shared helper for emitting an Elementor library template from one
     architecture placement (header / footer / popup / archive / single).
@@ -1048,6 +1506,22 @@ def _create_template_from_placement(
         )
         if inject_nav_menu_into_template(node, widget):
             print(f"  + injected nav-menu widget (menu='{menu_info['slug']}')")
+
+    # Footer-column menus — when the agent extracted multiple link columns
+    # from the footer (e.g. Company / Resources / Legal), append a nav-menu
+    # widget for each. They land inside the deepest container of the footer
+    # template; the developer can rearrange them in the editor afterwards.
+    if kind == "footer" and footer_column_menus:
+        for col_menu in footer_column_menus:
+            slug = col_menu.get("slug")
+            if not slug:
+                continue
+            w = (
+                make_nav_menu_widget(slug, layout="vertical")
+                if is_pro else make_wp_menu_widget(slug)
+            )
+            if inject_nav_menu_into_template(node, w):
+                print(f"  + injected footer-column nav-menu (menu='{slug}')")
 
     # Slug shape: site--kind  (e.g. "acme-site--header"). Stable across
     # runs; the bridge upserts on (slug, template_type).

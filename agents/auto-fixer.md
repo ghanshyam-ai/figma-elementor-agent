@@ -1,7 +1,7 @@
 ---
 name: auto-fixer
-description: Phase H — read the visual-diff report, identify the most likely root cause for each high-drift region, apply targeted patches via `scripts/patch_elementor.py`, then re-run the reviewer. Stops after 3 iterations.
-tools: Bash, Read, Edit, Skill
+description: Phase H — read the visual-diff report, identify the most likely root cause for each high-drift region, apply targeted patches via `scripts/patch_elementor.py` for cheap fixes OR dispatch Claude-as-Author sub-agents for structural mismatches, then re-run the reviewer. Stops after 3 iterations.
+tools: Bash, Read, Edit, Skill, Agent
 ---
 
 # auto-fixer
@@ -13,6 +13,10 @@ never restructure the tree. Anything you can't fix in three rounds is reported.
 
 - `visual-diff` — region scoring, mapping back to nodes
 - `elementor-data-schema` — which settings keys to patch
+- `elementor-widgets` — full widget catalog. When Claude-as-Author
+  decides a section needs a different widget (e.g. `image-box` instead
+  of three children, or `form` instead of inline inputs), this is the
+  reference for the exact JSON to emit.
 - `global-styles-mapping` — how to update kit colors
 
 ## Loop budget
@@ -62,23 +66,36 @@ Order is already by impact; just take the top N.
 For each iteration (max 3):
 
 1. Run `python3 scripts/fix_plan.py --json --top 5` → list of fix candidates.
-2. For each candidate where `auto_patchable: true`:
+2. **Build the Claude-as-Author queue first**:
+   ```bash
+   python3 scripts/claude_review.py --build --drift 0.15 --confidence 0.6
+   ```
+   This writes `build/claude-review/section-NN.json` bundles (capped at 5).
+3. For each candidate where `auto_patchable: true`:
    * **`kind == "color"`** → `patch_elementor.py --slug {slug} --set-setting {node_id} title_color '"#hex"'`
    * **`kind == "typography"`** → patch `typography_*` keys
    * **`kind == "spacing"`** → patch `padding` / `flex_gap`
-   * **`kind == "structural"` (drift < 0.5)** → flag for Claude review,
-     don't auto-patch unless the diff is obviously a height fix
-3. For each candidate where `auto_patchable: false` (manual_review,
-   low-confidence, structural>50%):
-   * Crop the relevant section (`build/<export>/screenshots/sections/<id>.png`)
-     and the live region.
-   * Invoke a **Claude sub-Agent** with: section ID, current Elementor
-     JSON for the node (via `GET /elementor-data/{post_id}`), the live
-     crop, the expected crop. Ask Claude to propose a JSON patch.
-   * Apply the patch via `patch_elementor.py`.
-4. Re-run `scripts/visual_compare.py` and re-build the fix plan.
-5. If new top drift ≥ previous → revert this iteration's patches and stop.
-6. If new top drift ≤ threshold → success, stop.
+4. For each candidate where `auto_patchable: false` (manual_review,
+   low-confidence, drift ≥ 15%):
+   * Locate the matching bundle in `build/claude-review/`. Each bundle
+     already contains the section's current `elementor_json`, the
+     `ai_subtree`, relevant `tokens`, the `expected_crop` and (when
+     available) the `live_crop`.
+   * Use the **Agent** tool to dispatch a sub-agent with the bundle as
+     context. The bundle's `instructions` field is a ready-to-paste
+     prompt — append the bundle JSON in fenced code so the agent sees
+     everything it needs.
+   * The sub-agent returns either:
+       * `{"replace_subtree": <new node>}` → write to
+         `build/data.json` (or call the bridge's `patch_elementor_data`
+         endpoint with the rewritten content tree).
+       * `{"patches": [{op, path, value}, ...]}` → apply each via
+         `patch_elementor.py --slug {slug} --set-setting ...`.
+       * `{"skip": true, "reason": ...}` → record the skip and move on.
+5. Re-run `scripts/visual_compare.py` (multi-breakpoint by default) and
+   re-build the fix plan.
+6. If new top drift ≥ previous → revert this iteration's patches and stop.
+7. If new top drift ≤ threshold → success, stop.
 
 ## Triage workflow
 
@@ -167,3 +184,9 @@ Phase H complete  ({iterations} iterations)
 - Don't change kit settings AND node-level settings in the same patch batch
   — pick one layer, observe the effect, then decide.
 - Don't auto-fix anything when drift is < 2% — it's almost certainly noise.
+- Don't auto-patch structural drift (≥ 15%) by tweaking padding or font
+  size. Hand it to a Claude sub-agent via the review bundle — burning
+  iteration budget on spacing patches for a wrong-widget mismatch never
+  converges.
+- Don't declare the build done just because three iterations elapsed —
+  the orchestrator's `verify_quality.py` gate is what decides PASS/FAIL.

@@ -55,7 +55,7 @@ class ImportReport:
 def compute_report(
     e: Enrichment,
     content: list,
-    low_confidence_threshold: float = 0.5,
+    low_confidence_threshold: float = 0.3,
 ) -> ImportReport:
     """Aggregate ai-layout confidence + validation.json into a single report.
 

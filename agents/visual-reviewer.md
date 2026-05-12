@@ -16,8 +16,13 @@ state. The auto-fixer (Phase H) handles fixes.
 ## Run
 
 ```bash
-python3 scripts/visual_compare.py --config project-config.json --width 1920 --threshold 0.05
+python3 scripts/visual_compare.py --config project-config.json --threshold 0.05
 ```
+
+By default this captures THREE viewports — desktop (1920), tablet (768),
+mobile (375) — and diffs each against any matching baseline in the
+plugin export's `screenshots/` directory. Pass `--viewports desktop-only`
+to fall back to the legacy single-shot capture.
 
 First run will install npm deps + Playwright Chromium (~1 minute). Subsequent
 runs are fast.
@@ -26,21 +31,40 @@ runs are fast.
 
 ```
 build/diff/
-├── live.png          ← live page screenshot (full page)
-├── expected.png      ← Figma screenshot resized to live width
-├── diff.png          ← red where pixels differ
-└── report.json       ← {drift, regions[], passed}
+├── live.desktop.png  ← live page screenshot at 1920 (full page)
+├── live.tablet.png   ← live page screenshot at 768
+├── live.mobile.png   ← live page screenshot at 375
+├── expected.png      ← Figma full-page screenshot (only if export contains one)
+├── diff.png          ← red where desktop pixels differ
+├── diff.tablet.png   ← (only when tablet baseline exists in export)
+├── diff.mobile.png   ← (only when mobile baseline exists in export)
+└── report.json       ← {drift, regions[], passed, per_breakpoint}
 ```
+
+## Refuses to diff without a baseline
+
+`visual_compare.py` only accepts an explicit full-page baseline filename
+(`page.png`, `home.png`, `full.png`, or `full-page.png`) from
+`export/screenshots/`. If no full-page screenshot is present in the export,
+the script writes `passed: false` + `no_baseline: true` and the quality
+gate fails — instead of fabricating a pass from a section thumbnail
+(which is what the previous code did). When this happens, tell the
+developer the plugin export is missing the page-level screenshot.
 
 ## What to print
 
 ```
-{PASS|FAIL}  drift={pct}%  diffPixels={n}  ({width}×{height})
-worst region: y={y0}..{y1}, drift={pct}%
+{PASS|FAIL}  desktop_drift={pct}%  diffPixels={n}  ({width}×{height})
+  tablet: {drift}%   (or "no baseline" / "—")
+  mobile: {drift}%
+worst desktop region: y={y0}..{y1}, drift={pct}%
 artifacts: build/diff/diff.png
 ```
 
-If FAIL, list the top 3 worst regions (by drift) with their `y0..y1` ranges.
+If FAIL, list the top 3 worst regions (by drift) with their `y0..y1`
+ranges for each breakpoint that exceeded threshold. The orchestrator's
+quality gate fails when ANY breakpoint exceeds threshold or when the
+desktop baseline is missing.
 
 ## Read `report.json` to triage
 

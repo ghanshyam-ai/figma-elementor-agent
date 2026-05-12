@@ -27,7 +27,9 @@ to `build/state.json` so Phase F doesn't duplicate them.
 
 ## When detection fails
 
-If `find_section()` returns nothing for header or footer:
+By default the importer enforces a **Theme Builder gate**: if header and
+footer aren't both detected, the run aborts with exit code 7 (it does not
+fall through to inline header/footer). When that happens:
 
 1. List the named layers in the tree:
    ```bash
@@ -45,8 +47,14 @@ If `find_section()` returns nothing for header or footer:
 
 2. Pick the layer the developer intends as header/footer.
 3. Update `project-config.json::header_pattern` / `footer_pattern` to match
-   (regex, case-insensitive).
+   (regex, case-insensitive). The detector also accepts the plugin's
+   `_ai_role: "navbar" | "footer"` even at low confidence, so add that
+   role to the layer in Figma if you can re-export.
 4. Re-run.
+
+In the rare case you genuinely want inline header/footer (a single-page
+landing, no theme chrome), pass `--no-require-theme-builder` to bypass
+the gate. The orchestrator's quality gate will still flag it.
 
 ## Pro detection
 

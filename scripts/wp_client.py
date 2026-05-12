@@ -246,6 +246,21 @@ class WPClient:
         self.ensure_authenticated()
         return self.post("figma-importer/v1/forms/gravity", json_body=spec)
 
+    def list_theme_nav_locations(self) -> list[dict]:
+        """Return the active theme's registered nav-menu locations.
+
+        Each entry: `{slug, label, assigned_menu_id}`. Used by the agent
+        so it can pick a real location slug instead of guessing
+        `menu-1` / `menu-2` (which only happen to exist on hello-elementor).
+        Returns an empty list when the bridge or theme doesn't support it.
+        """
+        self.ensure_authenticated()
+        try:
+            r = self.get("figma-importer/v1/theme/locations")
+        except WPError:
+            return []
+        return (r or {}).get("locations", [])
+
     def create_or_update_menu(
         self,
         name: str,

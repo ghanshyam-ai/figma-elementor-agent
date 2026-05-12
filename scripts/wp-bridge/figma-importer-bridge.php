@@ -85,7 +85,33 @@ add_action('rest_api_init', function () {
         'permission_callback' => function () { return current_user_can('manage_options'); },
         'callback'            => 'figma_importer_reset_media',
     ]);
+
+    // Lists the registered nav-menu locations for the active theme so the
+    // agent can pick a real location slug (e.g. "primary", "menu-1") rather
+    // than guessing "menu-1" / "menu-2" that may not exist for the theme.
+    register_rest_route($ns, '/theme/locations', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('edit_theme_options'); },
+        'callback'            => 'figma_importer_theme_locations',
+    ]);
 });
+
+function figma_importer_theme_locations() {
+    $registered = get_registered_nav_menus();    // [slug => human label]
+    $assigned   = get_theme_mod('nav_menu_locations', []);
+    $out = [];
+    foreach ($registered as $slug => $label) {
+        $out[] = [
+            'slug'  => $slug,
+            'label' => $label,
+            'assigned_menu_id' => isset($assigned[$slug]) ? (int) $assigned[$slug] : 0,
+        ];
+    }
+    return [
+        'theme'     => get_stylesheet(),
+        'locations' => $out,
+    ];
+}
 
 function figma_importer_health() {
     return [
@@ -429,9 +455,15 @@ function figma_importer_update_kit($req) {
 
     $page_settings_manager->save_settings($merged, $kit->get_id());
 
-    // Mirror across active autosaves so editor sessions don't clobber the change.
-    $users = get_users(['fields' => ['ID']]);
-    foreach ($users as $u) {
+    // Mirror across active autosaves so editor sessions don't clobber the
+    // change. Limit to administrators + editors (the only users who could
+    // realistically have a kit autosave) to keep this cheap on sites with
+    // thousands of subscribers.
+    $author_users = get_users([
+        'fields'   => ['ID'],
+        'role__in' => ['administrator', 'editor'],
+    ]);
+    foreach ($author_users as $u) {
         $autosave = $kit->get_autosave($u->ID);
         if ($autosave) {
             $page_settings_manager->save_settings($merged, $autosave->get_id());
