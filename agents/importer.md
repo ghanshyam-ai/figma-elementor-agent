@@ -68,6 +68,29 @@ PY
 (The `types.ModuleType` shim avoids importing requests when we just need the
 stats helper.)
 
+## Phase B' — Read-only plan + preflight (runs right after B)
+
+After extraction, BEFORE handing off to global-styles, the orchestrator
+runs the new plan-only mode:
+
+```bash
+.venv/bin/python scripts/import_elementor.py --plan-only
+```
+
+This emits:
+- `build/build-plan.json` — every section with its inferred kind +
+  chosen widget + confidence + tokens the section will use.
+- `build/widget-review-queue.json` — subset with widget confidence
+  below 0.7 (default). The orchestrator dispatches Claude-as-Author at
+  plan stage for these BEFORE the import does any WP writes.
+- A preflight summary covering brand-color naming, typography presets,
+  and `space_between_widgets`. `error`-severity issues abort the run
+  with exit code 8 — the orchestrator surfaces them so the developer
+  fixes Figma instead of burning a build cycle.
+
+The plan-only step doesn't touch WordPress. It re-uses the same
+deterministic detectors as the live import, on a deep copy of the tree.
+
 ## Don't
 
 - Don't modify any files inside `build/<export>/`. Treat the extracted

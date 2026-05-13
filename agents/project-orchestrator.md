@@ -110,6 +110,7 @@ At the end of any phase, print a one-block summary that includes:
 ```
 A. Setup       → wp-setup       (auth + bridge + Elementor + GF + Pro)
 B. Import      → importer       (extract ZIP, load enrichment)
+B'. Plan       → build_plan.py  (NEW — read-only plan + preflight + widget review queue)
 C. Globals     → global-styles  (kit colors, typography, spacing)
 D. Optimize    → optimization   (token resolver + collapse + widget-pref)
 E. Architecture→ wp-architecture (route sections to header/footer/popup/page)
@@ -117,9 +118,16 @@ F. Templates   → theme-builder  (create header/footer/popup/archive/single)
 G. Forms       → form-intelligence (GF creation when applicable)
 H. Reuse       → template-reuse (dedupe via library templates)
 I. Page        → page-builder   (assets + tree → page)
-J. Review      → visual-reviewer (capture + diff)
+J. Review      → visual-reviewer (capture + diff + per-section drift)
 K. Fix         → auto-fixer     (patch loop, max 3 iterations)
+L. Archive     → finalize_artifacts.py  (NEW — copy run into pages/<slug>/<ts>/)
 ```
+
+Phase B' is read-only — no WP writes. It produces `build/build-plan.json`
+and `build/widget-review-queue.json` and runs the preflight design-system
+check. The plan is the developer's checkpoint BEFORE the Y/n
+confirmation: if widget picks look wrong or preflight emits errors, they
+fix Figma instead of burning a full build cycle.
 
 Phases C → I run inside `scripts/import_elementor.py` as one process —
 it performs all the writes in dependency order. The split into named
@@ -138,8 +146,47 @@ When invoked with `start [free-form instructions]`:
    to phase scoping (which phases to run, which to skip), page slug,
    header/footer patterns, etc. Echo the resulting plan back before writing.
 3. Run **Phase A** (`wp-setup`). If it fails → print remediation, stop.
-4. Run **Phase B** (`importer`).
-5. Confirm with the developer:
+   * **NEW** Pro pre-decision: if `health.elementor_pro` is falsy AND the
+     developer didn't already say "inline" in their free-form instruction,
+     run the `wp-setup` pro-missing prompt (see wp-setup.md §6). Persist
+     the choice to `build/state.json::phase_a.pro_choice`. The orchestrator
+     passes `--no-require-theme-builder` to `import_elementor.py` when the
+     choice is `inline`, eliminating the silent exit-7 failure mode.
+4. Run **Phase B** (`importer`) — extract ZIP only.
+5. **NEW: Phase B' — Plan + preflight.** Run:
+   ```bash
+   .venv/bin/python scripts/import_elementor.py --plan-only
+   ```
+   This emits `build/build-plan.json`, `build/widget-review-queue.json`,
+   and the preflight design-system check WITHOUT any WP writes.
+   * If preflight returns any `error`-severity issue (e.g.
+     `unnamed-brand-colors`, `sparse-typography`) → tell the developer
+     to fix the Figma source and re-export. Stop here. The full run
+     would still finish but the quality gate is essentially guaranteed
+     to fail.
+   * If `widget-review-queue.json` has items → **dispatch Claude-as-Author
+     at plan stage** by running:
+     ```bash
+     .venv/bin/python scripts/claude_review.py --from-plan --confidence 0.7
+     ```
+     For each `build/claude-review/plan-section-*.json` bundle it
+     produces, use the **Agent** tool with the `elementor-widgets` skill
+     loaded. Send the bundle JSON as context and the bundle's
+     `instructions` as the prompt. Apply each `{widget, confidence,
+     reason}` response by patching `build/build-plan.json`'s widget
+     pick for that section. Cap at 5 dispatches.
+   * Catching wrong widget picks here eliminates the dominant cost: a
+     full Phase C–I + Phase J render cycle just to discover that an
+     icon-list was emitted where an accordion belonged.
+6. **NEW: Pre-apply cached patches** (page-by-page re-runs only). When
+   `build/fix_history.json` exists from a prior successful run of the
+   same `page_slug`:
+   ```bash
+   .venv/bin/python scripts/fix_history.py apply --slug {page_slug}
+   ```
+   Each cached patch is keyed by `_figma_name` — patches whose source
+   section was renamed or removed are skipped (logged but non-fatal).
+7. Confirm with the developer:
    ```
    About to write to {wp_url}:
    - Apply globals (kit {kit_id})
@@ -150,27 +197,35 @@ When invoked with `start [free-form instructions]`:
    ```
    Skip the prompt only if the developer said something like "go ahead" or
    "no confirmations" in the free-form instruction.
-6. Run **Phases C → F** by invoking the appropriate sub-agents (or the
+8. Run **Phases C → F** by invoking the appropriate sub-agents (or the
    single end-to-end importer in `scripts/import_elementor.py`, which is
    usually faster). The importer enforces the **Theme Builder gate** by
-   default — if header + footer cannot be detected as Theme Builder
-   templates the build aborts with exit code 7. If that happens, add
-   `header_pattern` / `footer_pattern` overrides to `project-config.json`
-   and re-run.
-7. **Claude-as-Author dispatch** (between F and G). Before declaring
-   the build done, run `python3 scripts/claude_review.py --build`. For
-   every bundle it produces under `build/claude-review/`, use the
-   **Agent** tool to dispatch a sub-agent with the bundle contents and
-   the `instructions` field as the prompt. Apply each result through
+   default — unless `phase_a.pro_choice == "inline"`, in which case the
+   orchestrator already passed `--no-require-theme-builder`.
+9. **Post-import Claude-as-Author dispatch** (between F and G). For
+   anything plan-stage didn't catch, run `python3 scripts/claude_review.py
+   --build`. For every bundle under `build/claude-review/section-*.json`,
+   use the **Agent** tool to dispatch a sub-agent with the bundle contents
+   and the `instructions` field as the prompt. Apply each result through
    `scripts/patch_elementor.py` (for `patches`) or by editing
    `build/data.json` then re-running `import_elementor.py --replay`
-   (for `replace_subtree`). Cap at 5 dispatches per build.
-8. Run **Phase G** (`visual-reviewer`) — multi-breakpoint by default
-   (desktop + tablet + mobile via the rewritten `visual_compare.py`).
-9. If drift > threshold → run **Phase H** (`auto-fixer`) up to 3 iterations,
-   re-running G between each. The auto-fixer now escalates any region
-   with `drift > 15%` to Claude review instead of patching padding.
-10. **Quality gate** (mandatory). Run:
+   (for `replace_subtree`). The 5-dispatch cap is shared with the
+   plan-stage dispatch — count both against the same budget.
+10. Run **Phase J** (`visual-reviewer`) — multi-breakpoint AND
+    per-section by default:
+    ```bash
+    .venv/bin/python scripts/visual_compare.py --per-section
+    ```
+    The `--per-section` flag adds `report.json::sections[]` with per-
+    section drift keyed by the elementor `data-id` and matched to the
+    Figma section screenshot. Auto-fixer uses these targets to skip the
+    y-band → section heuristic entirely.
+11. If drift > threshold → run **Phase K** (`auto-fixer`) up to 3
+    iterations, re-running J between each. The auto-fixer now escalates
+    any region with `drift > 15%` to Claude review instead of patching
+    padding, AND records successful patches to `build/fix_history.json`
+    so the next re-run of the same Figma file pre-applies them.
+12. **Quality gate** (mandatory). Run:
     ```bash
     python3 scripts/verify_quality.py --drift-threshold 0.05 --min-global-coverage 0.7
     ```
@@ -183,7 +238,19 @@ When invoked with `start [free-form instructions]`:
       * `manual_review_regions` is empty
       * `header` AND `footer` placements exist
       * global color coverage ≥ 70% AND typography coverage ≥ 70%
-11. Print final summary with live URL, edit URL, and remaining drift.
+13. **NEW: Phase L — Archive run artifacts.** Once the gate passes
+    (or even on failure — the archive captures both for debugging):
+    ```bash
+    .venv/bin/python scripts/finalize_artifacts.py --slug {page_slug} --keep-last 10
+    ```
+    Copies `build/build-plan.json`, `build/import-report.json`,
+    `build/diff/report.json`, `build/diff/diff.png`, `build/state.json`,
+    and `build/fix_history.json` into
+    `pages/<page_slug>/<timestamp>/`. `build/` stays the working
+    directory; `pages/` is the durable per-run history that survives
+    the next `rm -rf build` cycle.
+14. Print final summary with live URL, edit URL, remaining drift, and
+    the path to the archived run directory.
 
 When invoked with one of `globals|header|footer|page|review|fix`, run only
 that phase (skipping A is OK only if the agent already authenticated this

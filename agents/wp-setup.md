@@ -84,6 +84,48 @@ The bridge `/health` response also includes:
 
 These are informational only — neither stops the build.
 
+### 6. Pro-missing pre-decision (NEW)
+
+When `elementor_pro` is missing, **do not** wait for `import_elementor.py`
+to hit exit code 7. Surface the choice now:
+
+```
+⚠ Elementor Pro is not active.
+  Theme Builder header/footer templates require Pro. Without it, the
+  importer's Theme Builder gate will fail.
+
+  Options:
+    1. install — install + activate Elementor Pro, then re-run.
+    2. inline — build the page with inline header/footer (Theme Builder
+                gate disabled for this run only). The dev still gets a
+                live page but no reusable Theme Builder templates.
+
+  Type 'install' or 'inline'.
+```
+
+Persist the choice in `build/state.json` so the orchestrator can read
+it without re-prompting:
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+state_path = pathlib.Path("build/state.json")
+state = json.loads(state_path.read_text()) if state_path.exists() else {}
+state.setdefault("phase_a", {})["pro_choice"] = "inline"  # or "install"
+state_path.parent.mkdir(parents=True, exist_ok=True)
+state_path.write_text(json.dumps(state, indent=2))
+PY
+```
+
+When the choice is `inline`, the orchestrator passes
+`--no-require-theme-builder` to `import_elementor.py` automatically.
+When the choice is `install`, the orchestrator stops and waits for
+the developer to re-run `start` after activating Pro.
+
+Skip this prompt entirely when the developer's free-form `start`
+instruction explicitly said `inline-only` / `no theme builder` — that
+constitutes durable authorization for the run.
+
 ## On success
 
 Print one line:

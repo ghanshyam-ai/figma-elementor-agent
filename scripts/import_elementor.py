@@ -680,6 +680,11 @@ def main() -> int:
                     help="Override page_slug from config (for multi-page imports).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Don't write to WordPress; print intended actions.")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="Extract the ZIP, run section + widget inference read-only, "
+                         "emit build/build-plan.json + build/widget-review-queue.json, "
+                         "and exit 0 BEFORE touching WordPress. Lets the developer "
+                         "review widget choices before any writes.")
     ap.add_argument("--skip-globals", action="store_true",
                     help="Don't touch kit settings (useful for 2nd+ page on same site).")
     ap.add_argument("--skip-menus", action="store_true",
@@ -743,8 +748,8 @@ def main() -> int:
         args.skip_header_footer = True
         args.skip_template_reuse = True  # only run reuse on first run for now
 
-    if args.dry_run:
-        # Dry run: read config without needing `requests`.
+    if args.dry_run or args.plan_only:
+        # Dry run / plan-only: read config without needing `requests`.
         cfg = json.loads(Path(args.config).read_text())
         client = None
     else:
@@ -783,7 +788,9 @@ def main() -> int:
     project_state.remember_run()
 
     # --- Auth + bridge ----------------------------------------------------
-    if not args.dry_run:
+    if args.plan_only:
+        print("• Plan-only mode — skipping auth, bridge, and all WordPress writes")
+    elif not args.dry_run:
         # The bridge mu-plugin must respond to /health BEFORE login (login is
         # itself a bridge endpoint). Auto-install if missing.
         wp_root_pre = cfg.get("wp_root")
@@ -836,6 +843,30 @@ def main() -> int:
     widget_summary = ", ".join(f"{k}={v}" for k, v in sorted(s["widgets"].items(), key=lambda x: -x[1]))
     print(f"  page: \"{data.get('title')}\"  containers={s['containers']}  widgets={s['widgets_total']}  ({widget_summary})")
     print(f"  assets={metadata['counts']['assets']}  screenshots={metadata['counts']['screenshots']}")
+
+    # --- Plan-only early exit --------------------------------------------
+    # Emits build/build-plan.json + build/widget-review-queue.json (and
+    # runs the pre-flight design-system check) WITHOUT any WP writes.
+    # The orchestrator wires this in BEFORE the Y/n confirmation so the
+    # developer can review widget choices and fix sparse tokens early.
+    if args.plan_only:
+        from build_plan import build_plan as _build_plan_fn, write_plan as _write_plan
+        plan = _build_plan_fn(export_dir)
+        plan_path, queue_path = _write_plan(plan)
+        print(f"\n✓ Plan written → {plan_path.relative_to(ROOT)}  "
+              f"({plan['stats']['total_sections']} sections, "
+              f"{plan['stats']['needs_review']} need widget review)")
+        print(f"  widget-review queue → {queue_path.relative_to(ROOT)}")
+        pf = plan.get("preflight") or {}
+        if pf.get("issues"):
+            print(f"\nPre-flight: {len(pf['issues'])} design-system issue(s)")
+            for issue in pf["issues"]:
+                marker = "✗" if issue["severity"] == "error" else "⚠"
+                print(f"  {marker} {issue['kind']}: {issue['detail']}")
+            if not pf.get("passed"):
+                print("\nFix the error(s) above in Figma before running the import.")
+                return 8
+        return 0
 
     # --- Enrichment (ai-layout + tokens + validation + assets manifest) --
     from enrich import load_enrichment

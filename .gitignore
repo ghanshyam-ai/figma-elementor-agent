@@ -2,6 +2,7 @@ config.json
 project-config.json
 project-state.json
 build/
+pages/
 __pycache__/
 *.pyc
 .pytest_cache/

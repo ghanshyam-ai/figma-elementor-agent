@@ -23,13 +23,49 @@ never restructure the tree. Anything you can't fix in three rounds is reported.
 
 You get **3 iterations**. After each:
 1. Apply at most 5 patches.
-2. Re-run `scripts/visual_compare.py`.
+2. Re-run `scripts/visual_compare.py --per-section` (per-section drift is
+   now the default — gives you `report.json::sections[]` keyed by
+   elementor `data-id`).
 3. If new drift ≥ previous drift → revert the last batch (the fixes made it
    worse; back out and stop).
-4. If new drift ≤ threshold → success, stop.
+4. If new drift ≤ threshold → success. Record every successful patch in
+   `build/fix_history.json` (see "Cache successful patches" below). Stop.
 5. Else → continue.
 
-After 3 iterations, stop and report what's left.
+After 3 iterations, stop and report what's left. ALSO record whatever
+patches did help (drift went down even if not below threshold) — they
+still give a head start on the next run.
+
+## Cache successful patches
+
+After the iteration that converged (or after iteration 3 if any patch
+strictly reduced drift), call `fix_history.record_patch(...)` for each
+patch in that batch. The history is keyed by `_figma_name` + `kind`, so
+it survives the regen cycle that changes Elementor node ids on every
+re-import.
+
+```python
+import sys; sys.path.insert(0, 'scripts')
+from fix_history import record_patch, save_history
+
+# Inside the per-iteration loop, after a successful patch:
+record_patch(
+    figma_name=node["settings"].get("_figma_name") or "(unnamed)",
+    figma_id=node["settings"].get("_figma_id"),
+    kind="color",           # or "spacing" / "typography"
+    key="title_color",
+    value="#0F172A",
+    drift_before=0.18,
+    drift_after=0.04,
+    iterations=1,
+)
+
+# Once the loop ends:
+save_history(page_slug="home")
+```
+
+The orchestrator pre-applies these on the NEXT run of the same page
+slug — see `project-orchestrator.md` decision-tree step 6.
 
 ## Triage source priority
 

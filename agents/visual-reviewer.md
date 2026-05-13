@@ -16,13 +16,22 @@ state. The auto-fixer (Phase H) handles fixes.
 ## Run
 
 ```bash
-python3 scripts/visual_compare.py --config project-config.json --threshold 0.05
+python3 scripts/visual_compare.py --config project-config.json --threshold 0.05 --per-section
 ```
 
 By default this captures THREE viewports — desktop (1920), tablet (768),
 mobile (375) — and diffs each against any matching baseline in the
 plugin export's `screenshots/` directory. Pass `--viewports desktop-only`
 to fall back to the legacy single-shot capture.
+
+The `--per-section` flag (recommended) ALSO crops the desktop live
+screenshot by each top-level Elementor section's bounding rect (via
+Playwright `getBoundingClientRect()`), and diffs each crop against the
+matching Figma section screenshot under
+`build/<export>/screenshots/sections/<figma_id>.png`. Per-section drift
+lands in `report.json::sections[]` keyed by elementor `data-id`. This
+gives the auto-fixer exact node-id targets and eliminates the
+y-band → section heuristic that produced false fixes in prior runs.
 
 First run will install npm deps + Playwright Chromium (~1 minute). Subsequent
 runs are fast.

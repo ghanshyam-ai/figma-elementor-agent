@@ -137,6 +137,12 @@ def main() -> int:
     ap.add_argument("--viewports", default="default",
                     help="'default' (desktop+tablet+mobile), 'desktop-only', or "
                          "JSON viewport list. Use 'desktop-only' for legacy single-shot.")
+    ap.add_argument("--per-section", action="store_true",
+                    help="Also crop the live desktop screenshot per top-level "
+                         "Elementor section and diff each against the matching "
+                         "Figma section screenshot under build/<export>/screenshots/sections/. "
+                         "Per-section drift is added to report.json::sections and gives "
+                         "the auto-fixer exact node_ids instead of fuzzy y-band guesses.")
     args = ap.parse_args()
 
     cfg = json.loads(Path(args.config).read_text())
@@ -229,6 +235,33 @@ def main() -> int:
     if manual_bands:
         report["passed_with_manual_review"] = False
 
+    # --- Per-section drift (opt-in) ---------------------------------------
+    # Crops the desktop live capture by each top-level Elementor section's
+    # bounding rect (via Playwright getBoundingClientRect()) and diffs each
+    # against the matching Figma section PNG. Per-section drift gives the
+    # auto-fixer exact node_id targets, eliminating the y-band → section
+    # heuristic that's the main source of false-positive fixes.
+    if args.per_section:
+        try:
+            sections = _per_section_diff(
+                page_url, export_dir,
+                live_path=(BUILD_DIFF / (live_base.stem + ".desktop" + live_base.suffix)),
+                build_diff=BUILD_DIFF,
+                width=args.width,
+                threshold=args.threshold,
+            )
+            report["sections"] = sections
+            if sections:
+                worst = max(sections, key=lambda s: s.get("drift") or 0.0)
+                print(f"\nPer-section diff: {len(sections)} section(s) analysed")
+                print(f"  worst: {worst.get('figma_name') or worst['data_id']} "
+                      f"({(worst.get('drift') or 0)*100:.1f}% drift)")
+        except Exception as exc:
+            # Per-section is non-blocking — the overall report still
+            # determines pass/fail. Log and continue.
+            print(f"  (per-section diff skipped: {exc})")
+            report["sections_error"] = str(exc)
+
     (BUILD_DIFF / "report.json").write_text(json.dumps(report, indent=2))
 
     status = "PASS" if report["passed"] else "FAIL"
@@ -258,6 +291,199 @@ def _find_breakpoint_baseline(export_dir: Path, breakpoint: str) -> Path | None:
             p = shots / f"{prefix}.{breakpoint}{suffix}.png"
             if p.exists():
                 return p
+    return None
+
+
+def _per_section_diff(
+    page_url: str,
+    export_dir: Path,
+    live_path: Path,
+    build_diff: Path,
+    width: int,
+    threshold: float,
+) -> list[dict]:
+    """Compute per-section drift by cropping the live desktop screenshot.
+
+    For each top-level Elementor section on the live page, find its
+    bounding rect, crop the matching region from `live_path`, and diff
+    it against the corresponding Figma section screenshot under
+    `<export>/screenshots/sections/<figma_id>.png`. The pairing uses
+    `build/data.json` (the post-regen tree) to map elementor `data-id`
+    → `_figma_id` settings.
+
+    Returns a list of section results. Each entry has:
+        { data_id, figma_id, figma_name, x, y, width, height,
+          drift, live_crop, expected, passed }
+    Sections without a matching expected crop get `skipped: "no-baseline"`.
+    """
+    if not live_path.exists():
+        raise RuntimeError(f"desktop live capture missing at {live_path}")
+
+    # 1. Fetch the bounding rects for top-level sections on the live page
+    cmd = [
+        "node", str(SCRIPTS / "playwright_section_rects.js"),
+        "--url", page_url, "--width", str(width),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    rects = json.loads(result.stdout.strip().splitlines()[-1])
+    if not rects:
+        return []
+
+    # 2. Build {data_id → settings._figma_id} from build/data.json
+    figma_id_by_data_id = _build_figma_id_lookup()
+
+    # 3. Crop each rect from the live screenshot and diff
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("Pillow is required for --per-section diffing")
+
+    crops_dir = build_diff / "sections"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+
+    live_img = Image.open(live_path)
+    iw, ih = live_img.size
+    # Live captures use deviceScaleFactor=2 → pixel dims are 2× the CSS dims
+    scale = iw / max(1, width)
+
+    sections: list[dict] = []
+    for rect in rects:
+        data_id = rect.get("data_id")
+        figma_id = figma_id_by_data_id.get(data_id, {}).get("figma_id")
+        figma_name = figma_id_by_data_id.get(data_id, {}).get("figma_name") or ""
+
+        x0 = max(0, int(rect["x"] * scale))
+        y0 = max(0, int(rect["y"] * scale))
+        x1 = min(iw, int((rect["x"] + rect["width"]) * scale))
+        y1 = min(ih, int((rect["y"] + rect["height"]) * scale))
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        live_crop_path = crops_dir / f"{data_id}.png"
+        live_img.crop((x0, y0, x1, y1)).save(live_crop_path)
+
+        section_entry: dict = {
+            "data_id": data_id,
+            "figma_id": figma_id,
+            "figma_name": figma_name,
+            "x": int(rect["x"]), "y": int(rect["y"]),
+            "width": int(rect["width"]), "height": int(rect["height"]),
+            "live_crop": str(live_crop_path),
+        }
+
+        expected_path = _find_section_expected(export_dir, figma_id, figma_name)
+        if not expected_path:
+            section_entry["skipped"] = "no-baseline"
+            section_entry["drift"] = None
+            section_entry["passed"] = None
+            sections.append(section_entry)
+            continue
+
+        diff_path = crops_dir / f"{data_id}.diff.png"
+        try:
+            r = run_diff(live_crop_path, expected_path, diff_path)
+            section_entry["drift"] = r.get("drift")
+            section_entry["diff"] = str(diff_path)
+            section_entry["expected"] = str(expected_path)
+            section_entry["passed"] = bool(
+                (r.get("drift") or 0) <= threshold
+            )
+        except subprocess.CalledProcessError as exc:
+            section_entry["error"] = exc.stderr or str(exc)
+            section_entry["drift"] = None
+            section_entry["passed"] = False
+        sections.append(section_entry)
+
+    return sections
+
+
+def _build_figma_id_lookup() -> dict[str, dict]:
+    """Return {live_data_id: {figma_id, figma_name}} for all containers.
+
+    `build/data.json` carries the agent's PRE-regen ids — Elementor's
+    `iterate_data` hook regenerates every id at write time. The live page
+    therefore exposes POST-regen `data-id` values. We bridge the two via
+    `build/id_map.json` (pre → post), inverted here, so a `data-id` from
+    the live DOM can resolve back to its `_figma_id`.
+    """
+    build = ROOT / "build"
+    data_path = build / "data.json"
+    if not data_path.exists():
+        return {}
+    try:
+        tree = json.loads(data_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    content = tree.get("content") if isinstance(tree, dict) else tree
+
+    # post-regen → pre-regen (inverse of the saved id_map). When id_map
+    # is missing (first run failed to read back the live tree), assume
+    # ids didn't change and fall through to identity matching.
+    id_map_path = build / "id_map.json"
+    pre_by_post: dict[str, str] = {}
+    if id_map_path.exists():
+        try:
+            saved = json.loads(id_map_path.read_text())
+            if isinstance(saved, dict):
+                pre_by_post = {post: pre for pre, post in saved.items() if post}
+        except json.JSONDecodeError:
+            pre_by_post = {}
+
+    # First pass: pre-regen id → figma metadata
+    by_pre: dict[str, dict] = {}
+
+    def walk(n):
+        if not isinstance(n, dict):
+            return
+        eid = n.get("id")
+        if eid:
+            s = n.get("settings") or {}
+            by_pre[eid] = {
+                "figma_id": s.get("_figma_id") or s.get("figma_id"),
+                "figma_name": s.get("_figma_name"),
+            }
+        for c in n.get("elements") or []:
+            walk(c)
+
+    if isinstance(content, list):
+        for top in content:
+            walk(top)
+
+    # Second pass: project to post-regen ids when id_map is present.
+    # Otherwise fall back to identity so the lookup is still useful on
+    # first runs.
+    if pre_by_post:
+        return {post: by_pre[pre] for post, pre in pre_by_post.items() if pre in by_pre}
+    return by_pre
+
+
+def _find_section_expected(export_dir: Path, figma_id: str | None, figma_name: str | None) -> Path | None:
+    """Locate the matching Figma section screenshot.
+
+    Search order (most-specific first):
+      1. screenshots/sections/<figma_id>.png
+      2. screenshots/sections/<sanitized figma_name>.png
+      3. screenshots/<figma_id>.png (legacy layout — section_crops.py
+         used to write here before the dedicated sections/ dir)
+    """
+    shots = export_dir / "screenshots"
+    if not shots.exists():
+        return None
+
+    candidates = []
+    if figma_id:
+        safe_id = str(figma_id).replace(":", "_").replace("/", "_")
+        candidates += [
+            shots / "sections" / f"{safe_id}.png",
+            shots / "sections" / f"{safe_id}@2x.png",
+            shots / f"{safe_id}.png",
+        ]
+    if figma_name:
+        safe_name = str(figma_name).replace(":", "_").replace("/", "_").replace(" ", "-")
+        candidates.append(shots / "sections" / f"{safe_name}.png")
+    for c in candidates:
+        if c.exists():
+            return c
     return None
 
 
