@@ -45,6 +45,12 @@ COPY_FILES = [
     "widget-review-queue.json",
     "state.json",
     "fix_history.json",
+    "data.json",
+    "id_map.json",
+    "wp_drift.json",
+    "figma-suggestions.md",
+    "regression-report.json",
+    "a11y-report.json",
 ]
 
 COPY_DIRS_WITH_FILES = {
@@ -63,6 +69,22 @@ def _load_config() -> dict:
         return {}
 
 
+def _safe_run_module(mod_name: str, fn_name: str | None = None) -> None:
+    """Best-effort: import and run a side-effect-only module/function.
+
+    Used to fire optional artifact generators (figma_feedback,
+    regression_diff) inline before archiving. Any exception is logged
+    and swallowed — the archive should never fail because of these.
+    """
+    try:
+        import importlib
+        mod = importlib.import_module(mod_name)
+        if fn_name and hasattr(mod, fn_name):
+            getattr(mod, fn_name)()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped {mod_name}: {exc})")
+
+
 def finalize(slug: str, keep_last: int | None = None) -> Path:
     """Copy the current build artifacts into pages/<slug>/<timestamp>/.
 
@@ -70,6 +92,45 @@ def finalize(slug: str, keep_last: int | None = None) -> Path:
     """
     if not BUILD.exists():
         raise SystemExit("No build/ directory to archive. Run the importer first.")
+
+    # Generate the auxiliary reports BEFORE the archive copy so they
+    # land alongside the rest of the run's artifacts.
+    try:
+        from a11y_audit import audit_a11y
+        data_path = BUILD / "data.json"
+        state_path = BUILD / "state.json"
+        if data_path.exists():
+            data = json.loads(data_path.read_text())
+            state = json.loads(state_path.read_text()) if state_path.exists() else {}
+            issues = audit_a11y(
+                data.get("content") if isinstance(data, dict) else data,
+                state.get("kit_globals") or {},
+            )
+            (BUILD / "a11y-report.json").write_text(
+                json.dumps({"total": len(issues), "issues": issues}, indent=2)
+            )
+            if issues:
+                errs = sum(1 for i in issues if i["severity"] == "error")
+                print(f"  a11y: {len(issues)} issue(s) ({errs} error / "
+                      f"{len(issues) - errs} warn) — see a11y-report.json")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (a11y_audit skipped: {exc})")
+
+    try:
+        from figma_feedback import build_suggestions
+        (BUILD / "figma-suggestions.md").write_text(build_suggestions())
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (figma_feedback skipped: {exc})")
+
+    try:
+        from regression_diff import regression_report
+        report = regression_report(slug)
+        (BUILD / "regression-report.json").write_text(json.dumps(report, indent=2))
+        if report.get("regressions"):
+            print(f"  ⚠ regression vs {report.get('baseline')}: "
+                  f"{len(report['regressions'])} item(s) — see regression-report.json")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (regression_diff skipped: {exc})")
 
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = PAGES / slug / ts

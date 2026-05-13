@@ -36,6 +36,7 @@ from optimize import (
     _looks_like_divider, _convert_to_divider,
     _looks_like_spacer, _convert_to_spacer,
 )
+from widget_fingerprints import check_fingerprint
 
 
 # Order matters: most-specific detectors first. Once a node is converted
@@ -59,6 +60,33 @@ INFERENCE_PIPELINE = [
 ]
 
 
+# Per-kind ceilings now live in widget_fingerprints.FINGERPRINTS — the
+# guard checks descendant count, widget-type allowlist, and text density
+# in one pass. Kept here as a backwards-compat alias used by external
+# scripts that imported it.
+from widget_fingerprints import FINGERPRINTS
+MAX_DESCENDANTS_BY_KIND = {
+    k: fp.max_descendants for k, fp in FINGERPRINTS.items() if fp.max_descendants is not None
+}
+
+
+def _descendant_count(node) -> int:
+    """Count all dict descendants under `node` (excluding `node` itself)."""
+    n = 0
+    def walk(x):
+        nonlocal n
+        if isinstance(x, dict):
+            for c in x.get("elements") or []:
+                if isinstance(c, dict):
+                    n += 1
+                    walk(c)
+        elif isinstance(x, list):
+            for it in x:
+                walk(it)
+    walk(node)
+    return n
+
+
 def infer_and_swap(content: list, structural_node_ids: set | None = None) -> dict[str, int]:
     """Walk the entire tree, swap matching containers for their inferred widget.
 
@@ -75,6 +103,7 @@ def infer_and_swap(content: list, structural_node_ids: set | None = None) -> dic
     # Two-pass: collect candidates first, then mutate. Mutating during walk
     # changes element identity and corrupts depth-first traversal.
     candidates: list[tuple[dict, str]] = []
+    rejected_fingerprint: dict[str, int] = {}
     for node in _walk_containers(content):
         if id(node) in structural_node_ids:
             continue
@@ -85,11 +114,24 @@ def infer_and_swap(content: list, structural_node_ids: set | None = None) -> dic
             continue
         for kind, detector, _converter in INFERENCE_PIPELINE:
             try:
-                if detector(node):
-                    candidates.append((node, kind))
-                    break
+                if not detector(node):
+                    continue
             except Exception:
                 continue
+            # Structural fingerprint guard: a detector saying "yes" is
+            # necessary but not sufficient. Compare the subtree against
+            # the kind's fingerprint (descendant count, widget-type
+            # allowlist, text density). A failure means the detector
+            # matched on a shape that doesn't make structural sense as
+            # this widget — leave the node a container and let either
+            # another detector or Claude-as-Author handle it.
+            passes, reason = check_fingerprint(node, kind)
+            if not passes:
+                bucket = f"{kind}:{reason}"
+                rejected_fingerprint[bucket] = rejected_fingerprint.get(bucket, 0) + 1
+                break
+            candidates.append((node, kind))
+            break
 
     # Apply the conversion. Container becomes a widget in place.
     for node, kind in candidates:
@@ -99,6 +141,11 @@ def infer_and_swap(content: list, structural_node_ids: set | None = None) -> dic
                 counters[kind] = counters.get(kind, 0) + 1
         except Exception:
             continue
+
+    if rejected_fingerprint:
+        counters["_rejected_fingerprint"] = rejected_fingerprint
+        # Back-compat key (sum of all rejections).
+        counters["_rejected_oversize"] = sum(rejected_fingerprint.values())
 
     return counters
 

@@ -94,11 +94,46 @@ ASSET_REF_RE = re.compile(
 )
 
 
-def _upload_subset(client, files: list[Path], dry_run: bool = False) -> dict[str, dict]:
+# Module-level list of asset upload failures captured during this run.
+# Each entry: {"path": str, "name": str, "reason": str}. Surfaced into
+# build/import-report.json so the quality gate can react instead of the
+# only signal being a console line a developer might miss.
+ASSET_UPLOAD_FAILURES: list[dict] = []
+
+
+def _record_upload_failure(path: Path, exc: Exception) -> None:
+    ASSET_UPLOAD_FAILURES.append({
+        "path": str(path),
+        "name": path.name,
+        "reason": str(exc),
+    })
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _upload_subset(
+    client,
+    files: list[Path],
+    dry_run: bool = False,
+    hash_map: dict[str, dict] | None = None,
+) -> dict[str, dict]:
     """Upload a specific list of files. Variant of upload_assets that takes
     files as input rather than scanning a directory — used by the project-
-    state-aware path that only uploads files not already on the site."""
+    state-aware path that only uploads files not already on the site.
+
+    `hash_map` is the persisted {sha256: {id,url}} from project_state.
+    A file whose hash is already known short-circuits the upload — the
+    Figma plugin frequently regenerates hashed filenames per export, so
+    matching by content hash prevents re-uploading identical bytes
+    under a new name (which would bloat the media library)."""
     asset_map: dict[str, dict] = {}
+    hash_map = hash_map or {}
     if dry_run:
         for img in files:
             print(f"  [dry] would upload {img.name}")
@@ -107,11 +142,32 @@ def _upload_subset(client, files: list[Path], dry_run: bool = False) -> dict[str
     _, WPError, _ = _wp_client_module()
     for img in files:
         try:
+            sha = _file_sha256(img)
+        except OSError:
+            sha = None
+        try:
+            size_bytes = img.stat().st_size
+        except OSError:
+            size_bytes = None
+        if sha and sha in hash_map:
+            cached = hash_map[sha]
+            asset_map[img.name] = {
+                "url": cached["url"], "id": cached["id"], "sha256": sha,
+                "size_bytes": size_bytes,
+            }
+            print(f"  ◦ {img.name} → reused by hash (id={cached['id']})")
+            continue
+        try:
             result = client.upload_media(img)
         except WPError as exc:
             print(f"  ✗ upload {img.name}: {exc}", file=sys.stderr)
+            _record_upload_failure(img, exc)
             continue
-        asset_map[img.name] = {"url": result["source_url"], "id": result["id"]}
+        asset_map[img.name] = {
+            "url": result["source_url"], "id": result["id"], "size_bytes": size_bytes,
+        }
+        if sha:
+            asset_map[img.name]["sha256"] = sha
         print(f"  ✓ {img.name} → id={result['id']}")
     return asset_map
 
@@ -134,6 +190,7 @@ def upload_assets(client, assets_dir: Path, dry_run: bool = False) -> dict[str, 
             result = client.upload_media(img)
         except WPError as exc:
             print(f"  ✗ upload {img.name}: {exc}", file=sys.stderr)
+            _record_upload_failure(img, exc)
             continue
         asset_map[img.name] = {"url": result["source_url"], "id": result["id"]}
         print(f"  ✓ {img.name} → id={result['id']}")
@@ -630,20 +687,174 @@ def inject_nav_menu_into_template(template_node: dict, menu_widget: dict) -> boo
     return True
 
 
-def _collect_node_ids(content) -> list[str]:
-    """Pre-order traversal of element ids — used to align pre- and post-
-    regen node identities by index."""
-    out: list[str] = []
-    def walk(n):
-        if isinstance(n, dict):
-            if n.get("id"):
-                out.append(n["id"])
-            for c in n.get("elements") or []:
+def _check_wp_side_drift(client, page_id: int, slug: str, build_dir) -> dict | None:
+    """Return a drift report if the live WP page diverges from the most
+    recent archived run.
+
+    Compares the live `_elementor_data` (post-regen ids, fetched via the
+    bridge) against `pages/<slug>/<latest>/data.json` (the pre-regen
+    tree the agent last wrote). We translate the live tree back to
+    pre-regen space via `settings._figma_pre_id` markers so the diff is
+    apples-to-apples — no false positives from id regeneration alone.
+
+    Returns None when no archived run exists yet (nothing to diff
+    against) or when WP-side drift detection is disabled.
+    """
+    from pathlib import Path as _Path
+    archive_root = _Path(__file__).resolve().parent.parent / "pages" / slug
+    if not archive_root.exists():
+        return None
+    runs = sorted([p for p in archive_root.iterdir() if p.is_dir()])
+    if not runs:
+        return None
+    last_data = runs[-1] / "data.json"
+    if not last_data.exists():
+        return None
+    try:
+        archived = json.loads(last_data.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    archived_tree = archived.get("content") if isinstance(archived, dict) else archived
+    if not isinstance(archived_tree, list):
+        return None
+
+    try:
+        live_tree = client.get_elementor_data(page_id)
+    except Exception as exc:
+        # Fetch failure isn't a drift; just bail and let the write
+        # proceed (the user might have a fresh site with the page id
+        # stale from project_state).
+        return {"drifted": False, "fetch_error": str(exc)}
+
+    # Build {pre_id → live_node_fingerprint} from the marker-stamped
+    # live tree. Compare against the same fingerprint built from the
+    # archived pre-regen tree.
+    def fingerprint(node) -> dict:
+        if not isinstance(node, dict):
+            return {}
+        s = node.get("settings") or {}
+        # Drop bookkeeping fields that change on every read-back.
+        ignore = {"_figma_pre_id", "_responsive_defaulted", "_vision_authored"}
+        filtered = {k: v for k, v in s.items() if k not in ignore}
+        return {
+            "kind": node.get("widgetType") or node.get("elType"),
+            "settings_hash": hashlib.sha1(
+                json.dumps(filtered, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:12],
+            "child_count": len(node.get("elements") or []),
+        }
+
+    def collect_by_pre_id(content, key_attr: str) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        def walk(n):
+            if isinstance(n, dict):
+                key = (n.get("settings") or {}).get(key_attr) if key_attr == "_figma_pre_id" else n.get("id")
+                if key:
+                    out[key] = fingerprint(n)
+                for c in n.get("elements") or []:
+                    walk(c)
+            elif isinstance(n, list):
+                for it in n:
+                    walk(it)
+        walk(content)
+        return out
+
+    archived_fp = collect_by_pre_id(archived_tree, "id")
+    live_fp = collect_by_pre_id(live_tree, "_figma_pre_id")
+    # Backwards compat: if a pre-fix run is the only archived baseline,
+    # the live tree won't have any _figma_pre_id markers yet (this is
+    # the first run with stamping enabled). In that case we have no
+    # apples-to-apples way to detect drift — skip rather than false-
+    # positive every node as "removed".
+    if not live_fp:
+        return None
+
+    changed_ids = []
+    for pre, fp_archived in archived_fp.items():
+        fp_live = live_fp.get(pre)
+        if fp_live is None:
+            changed_ids.append({"id": pre, "change": "removed"})
+            continue
+        if fp_live != fp_archived:
+            changed_ids.append({
+                "id": pre,
+                "change": "modified",
+                "archived": fp_archived,
+                "live": fp_live,
+            })
+    added = [k for k in live_fp.keys() if k not in archived_fp]
+    for nid in added:
+        changed_ids.append({"id": nid, "change": "added"})
+
+    drifted = bool(changed_ids)
+    report = {
+        "drifted": drifted,
+        "archived_run": str(runs[-1].name),
+        "page_id": page_id,
+        "changed_node_count": len(changed_ids),
+        "changes": changed_ids[:50],  # cap the report size
+        "summary": (
+            f"{len(changed_ids)} node(s) differ between live page and last archived "
+            f"run ({runs[-1].name})."
+        ) if drifted else "Live page matches the last archived build.",
+    }
+    drift_path = build_dir / "wp_drift.json"
+    drift_path.write_text(json.dumps(report, indent=2))
+    return report
+
+
+def _stamp_pre_regen_ids(content) -> int:
+    """Stamp every node's pre-regen id into settings._figma_pre_id.
+
+    The bridge's `figma_importer_iterate_data` regenerates every node id
+    at write time, so a positional zip of pre→post ids breaks the moment
+    iterate_data adds/removes/reorders a node (Pro widgets promote
+    children, control on_import hooks can mutate the subtree). We instead
+    stamp an in-tree marker that survives the round-trip — the bridge
+    preserves any settings key beginning with `_figma_`, so the marker
+    travels with its node regardless of how the tree is restructured.
+
+    Returns the number of nodes stamped.
+    """
+    n = 0
+    def walk(node):
+        nonlocal n
+        if isinstance(node, dict):
+            nid = node.get("id")
+            if nid:
+                s = node.setdefault("settings", {})
+                if isinstance(s, dict):
+                    s["_figma_pre_id"] = nid
+                    n += 1
+            for c in node.get("elements") or []:
                 walk(c)
-        elif isinstance(n, list):
-            for it in n:
+        elif isinstance(node, list):
+            for it in node:
                 walk(it)
     walk(content)
+    return n
+
+
+def _build_id_map_from_tree(live_tree) -> dict[str, str]:
+    """Walk the post-regen tree and return {pre_regen_id: post_regen_id}.
+
+    Pairs come from the `_figma_pre_id` marker stamped before send. No
+    order or count assumption — robust to iterate_data adding wrappers,
+    removing empty containers, or reshuffling siblings.
+    """
+    out: dict[str, str] = {}
+    def walk(node):
+        if isinstance(node, dict):
+            post = node.get("id")
+            pre = (node.get("settings") or {}).get("_figma_pre_id")
+            if pre and post:
+                out[pre] = post
+            for c in node.get("elements") or []:
+                walk(c)
+        elif isinstance(node, list):
+            for it in node:
+                walk(it)
+    walk(live_tree)
     return out
 
 
@@ -728,6 +939,15 @@ def main() -> int:
                     action="store_false")
     ap.add_argument("--skip-responsive-defaults", action="store_true",
                     help="Don't stamp _mobile / _tablet overrides on containers + headings.")
+    ap.add_argument("--force", action="store_true",
+                    help="Overwrite the live page even when WP-side drift is detected. "
+                         "WP-side drift means the page on the live site differs from the "
+                         "last archived build — typically because someone edited it in "
+                         "WP admin. Without --force, the agent refuses to overwrite (exit 5).")
+    ap.add_argument("--from-cache", action="store_true",
+                    help="Resume from build/data.json: skip ZIP extraction, optimization, "
+                         "and asset upload. Only re-applies the cached tree to the live page. "
+                         "Use for fast iteration when only the patch loop needs to re-run.")
     args = ap.parse_args()
 
     # --- Safety gate for destructive flags --------------------------------
@@ -832,12 +1052,41 @@ def main() -> int:
 
     # --- Extract + parse --------------------------------------------------
     build_dir = ROOT / "build"
-    export_dir = extract_zip(cfg["zip_path"], build_dir)
-    print(f"✓ Extracted to {export_dir.relative_to(ROOT)}")
 
-    data = json.loads((export_dir / "data.json").read_text())
-    global_json = json.loads((export_dir / "global.json").read_text())
-    metadata = json.loads((export_dir / "metadata.json").read_text())
+    # --from-cache short-circuit: skip ZIP extraction + optimization entirely.
+    # Useful for fast iteration when the user has manually edited
+    # build/data.json (or build_plan.json patched the tree) and wants to
+    # just push it without re-running the full pipeline. Skips imply:
+    # globals already applied, assets already uploaded, theme builder
+    # templates already created — i.e. a build that has previously
+    # completed at least once.
+    if args.from_cache:
+        existing_data = build_dir / "data.json"
+        if not existing_data.exists():
+            print(
+                "✗ --from-cache requires a prior successful build "
+                f"(build/data.json not found at {existing_data}).",
+                file=sys.stderr,
+            )
+            return 8
+        # Reuse the previous export dir + tree. Find it from the prior state.
+        prior_state = json.loads((build_dir / "state.json").read_text()) if (build_dir / "state.json").exists() else {}
+        export_dir = Path(prior_state.get("export_dir") or (build_dir / "export"))
+        print(f"✓ --from-cache: reusing {existing_data.relative_to(ROOT)} (no extraction)")
+        for f in ("skip_assets", "skip_globals", "skip_header_footer",
+                  "skip_menus", "skip_forms", "skip_template_reuse",
+                  "skip_fallbacks", "skip_optimize"):
+            setattr(args, f, True)
+        data = {"content": json.loads(existing_data.read_text())["content"], "title": prior_state.get("page_slug", "home")}
+        global_json = json.loads((export_dir / "global.json").read_text()) if (export_dir / "global.json").exists() else {}
+        metadata = {"counts": {"assets": 0, "screenshots": 0}}
+    else:
+        export_dir = extract_zip(cfg["zip_path"], build_dir)
+        print(f"✓ Extracted to {export_dir.relative_to(ROOT)}")
+
+        data = json.loads((export_dir / "data.json").read_text())
+        global_json = json.loads((export_dir / "global.json").read_text())
+        metadata = json.loads((export_dir / "metadata.json").read_text())
 
     s = widget_stats(data["content"])
     widget_summary = ", ".join(f"{k}={v}" for k, v in sorted(s["widgets"].items(), key=lambda x: -x[1]))
@@ -901,8 +1150,13 @@ def main() -> int:
             new_files = [p for p in assets_dir.iterdir() if p.is_file() and p.name not in existing]
             print(f"→ Upload {len(new_files)} new asset(s) (skipping {len(existing)} already on site)")
             if new_files:
-                # Upload only the genuinely new files.
-                asset_map.update(_upload_subset(client, new_files, dry_run=args.dry_run))
+                # Upload only the genuinely new files. Hash-keyed dedup
+                # catches files the plugin renamed but didn't change.
+                asset_map.update(_upload_subset(
+                    client, new_files,
+                    dry_run=args.dry_run,
+                    hash_map=(project_state.asset_map_by_hash if project_state else {}),
+                ))
         else:
             print("  (no assets/images directory)")
         # Upload screenshots too — they're the source for low-confidence
@@ -1067,7 +1321,10 @@ def main() -> int:
             from optimize import apply_responsive_defaults
             rstats = apply_responsive_defaults(content)
             optimize_stats["responsive_containers"] = rstats["containers"]
+            optimize_stats["responsive_rows"] = rstats.get("rows", 0)
             optimize_stats["responsive_headings"] = rstats["headings"]
+            optimize_stats["responsive_images"] = rstats.get("images", 0)
+            optimize_stats["responsive_buttons"] = rstats.get("buttons", 0)
         print(
             f"✓ Optimize: {optimize_stats['colors']} colors→globals, "
             f"{optimize_stats['typography']} typo→globals, "
@@ -1075,9 +1332,15 @@ def main() -> int:
             f"{optimize_stats['collapsed']} containers collapsed, "
             f"{optimize_stats['hoisted']} hoisted (depth≤{args.max_depth}), "
             f"{optimize_stats['widgets_swapped']} widgets swapped, "
-            f"{optimize_stats['html_replaced']} html→text-editor, "
-            f"{optimize_stats['responsive_containers']} containers got _mobile defaults"
+            f"{optimize_stats['html_replaced']} html→text-editor"
         )
+        if not args.skip_responsive_defaults:
+            print(
+                f"  responsive: {optimize_stats['responsive_rows']} rows stacked, "
+                f"{optimize_stats['responsive_headings']} headings scaled, "
+                f"{optimize_stats['responsive_images']} images→100% mobile, "
+                f"{optimize_stats['responsive_buttons']} buttons→full-width mobile"
+            )
 
     # --- Globalization coverage check (gate-friendly) ---------------------
     global_coverage: dict = {"colors": 1.0, "typography": 1.0, "details": {}}
@@ -1254,19 +1517,30 @@ def main() -> int:
     if args.require_theme_builder and not args.skip_header_footer and not args.page_only:
         has_header = bool(by_kind(placements, "header"))
         has_footer = bool(by_kind(placements, "footer"))
+        # Partial Theme Builder: if at least one of header/footer is
+        # detected, proceed with that template and let the theme's
+        # default render the other. The hard failure (exit 7) is now
+        # reserved for the case where NEITHER is detected — that's the
+        # signal that section detection genuinely failed and the user
+        # needs to fix the Figma layer naming.
+        if not (has_header or has_footer):
+            print("\n✗ Theme Builder gate FAILED — neither header nor footer detected.")
+            print("  The agent cannot create Theme Builder templates without at least one")
+            print("  chrome section. Fix options:")
+            print("    1. Improve the Figma layer name to match the patterns in")
+            print("       section_finder.NAME_RX (e.g. \"Header\", \"Navbar\", \"Footer\").")
+            print("    2. Set `header_pattern` / `footer_pattern` regex overrides in project-config.json.")
+            print("    3. Re-run with --no-require-theme-builder for a fully inline build.")
+            return 7
         if not (has_header and has_footer):
             missing = []
             if not has_header: missing.append("header")
             if not has_footer: missing.append("footer")
-            print(f"\n✗ Theme Builder gate FAILED — could not detect {' and '.join(missing)} section(s).")
-            print( "  The agent will not silently fall through to inline header/footer because")
-            print( "  the user requirement is that they MUST be Theme Builder templates.")
-            print(f"  Fix options:")
-            print(f"    1. Improve the Figma layer name to match the patterns in")
-            print(f"       section_finder.NAME_RX (e.g. \"Header\", \"Navbar\", \"Footer\", \"Site Footer\").")
-            print(f"    2. Set `header_pattern` / `footer_pattern` regex overrides in project-config.json.")
-            print(f"    3. Re-run with --no-require-theme-builder to allow inline header/footer (not recommended).")
-            return 7
+            print(f"\n⚠ Partial Theme Builder mode — proceeding without {' and '.join(missing)}.")
+            print("  The detected chrome will become Theme Builder templates; the missing")
+            print("  side will fall through to the theme's default. This is fine for")
+            print("  designs that intentionally use only a custom header OR custom footer.")
+            print("  To enforce both, fix the Figma layer naming and re-run.")
 
     # Header / Footer / Popup / Archive / Single / Search / 404 — by placements
     if not args.skip_header_footer:
@@ -1333,17 +1607,17 @@ def main() -> int:
     if not args.skip_page:
         slug = cfg.get("page_slug") or "home"
         title = data.get("title", slug)
-        # Pick the right page template:
-        #   • elementor_canvas — only when WE created Theme Builder header/footer
-        #     templates (otherwise the page renders with no chrome at all)
-        #   • elementor_header_footer — Full Width, theme's header/footer wrap
-        #     the Elementor content. Right default when no Figma header/footer
-        #     was detected.
-        #   • cfg.page_template — explicit override for advanced users
-        created_chrome = bool(by_kind(placements, "header") or by_kind(placements, "footer"))
+        # Page template:
+        #   • elementor_header_footer (Full Width) — keeps wp_head/wp_footer
+        #     hooks alive so Theme Builder header/footer templates can inject.
+        #     Right default when chrome lives in Theme Builder OR theme.
+        #   • elementor_canvas — strips wp_head/wp_footer; use ONLY when chrome
+        #     is built inline in the page body (start inline-only).
+        #   • cfg.page_template — explicit override for advanced users.
+        inline_mode = bool(cfg.get("inline_only"))
         page_template = (
             cfg.get("page_template")
-            or ("elementor_canvas" if created_chrome else "elementor_header_footer")
+            or ("elementor_canvas" if inline_mode else "elementor_header_footer")
         )
         # Page-level settings the user always wants:
         #   • hide_title — Elementor's "Hide Title" toggle (page settings)
@@ -1369,9 +1643,51 @@ def main() -> int:
         if args.dry_run:
             print(f"  [dry] would create page with {len(page_only)} top-level container(s)")
         else:
-            # Snapshot pre-regen ids so we can rebuild the post-regen id_map
-            # by walking the bridge's response in the same tree order.
-            pre_regen_ids = _collect_node_ids(page_only)
+            # WP-side drift detection: if a prior run imported this slug,
+            # the page already exists on the live site. Fetch the live
+            # _elementor_data and compare against pages/<slug>/<latest>/
+            # data.json. A divergence means someone hand-edited the page
+            # in WP admin between runs — silently overwriting would lose
+            # their work. The user must opt in via --force to overwrite.
+            # project_state.pages_imported is a list[{slug, page_id, ...}],
+            # not a dict — look up by iterating.
+            existing_page_id = None
+            if project_state:
+                for entry in (project_state.pages_imported or []):
+                    if isinstance(entry, dict) and entry.get("slug") == slug:
+                        existing_page_id = entry.get("page_id")
+                        break
+            drift_check = _check_wp_side_drift(
+                client, existing_page_id, slug, build_dir,
+            ) if existing_page_id else None
+            if drift_check and drift_check.get("drifted") and not args.force:
+                print(
+                    f"\n✗ WP-side drift detected on page id={existing_page_id} "
+                    f"(slug={slug})."
+                )
+                print(
+                    f"  {drift_check.get('summary')}"
+                )
+                print(
+                    f"  Detail: build/wp_drift.json"
+                )
+                print(
+                    "  The live page differs from the last successful build's "
+                    "data.json — someone has likely edited it in WP admin since "
+                    "the last `start`. Overwriting would lose those changes."
+                )
+                print(
+                    "  → To overwrite anyway, re-run with `start --force` (or "
+                    "pull the live changes back into Figma + re-export the ZIP)."
+                )
+                return 5
+
+            # Stamp every node with its pre-regen id so we can recover the
+            # mapping after the bridge's iterate_data regenerates ids. The
+            # marker survives the round-trip (bridge preserves `_figma_*`
+            # settings keys), so positional drift between pre/post no
+            # longer corrupts the map.
+            stamped = _stamp_pre_regen_ids(page_only)
 
             r = client.create_or_update_page(
                 slug=slug,
@@ -1385,14 +1701,19 @@ def main() -> int:
             print(f"  edit: {r['edit_url']}")
             project_state.record_page(slug, r["id"], r["permalink"])
 
-            # Read back the post-regen tree and build {pre_id → post_id}
-            # so auto-fixer / claude-review can reference nodes by stable id
-            # across the iterate_data regen barrier.
+            # Read back the post-regen tree and rebuild {pre_id → post_id}
+            # by walking the markers — no order assumption. Auto-fixer /
+            # claude-review / per-section diff all rely on this map being
+            # correct; a wrong map silently breaks every downstream lookup.
             try:
                 live_tree = client.get_elementor_data(r["id"])
-                post_regen_ids = _collect_node_ids(live_tree)
-                id_map = {pre: post for pre, post in zip(pre_regen_ids, post_regen_ids)}
+                id_map = _build_id_map_from_tree(live_tree)
                 (build_dir / "id_map.json").write_text(json.dumps(id_map, indent=2))
+                if stamped and len(id_map) < stamped:
+                    print(
+                        f"  ! id_map: {len(id_map)}/{stamped} nodes recovered "
+                        "(some markers lost in iterate_data — check bridge logs)"
+                    )
                 print(f"  + persisted id_map for {len(id_map)} node(s) → build/id_map.json")
             except Exception as exc:
                 print(f"  (could not build id_map: {exc})")
@@ -1459,6 +1780,27 @@ def main() -> int:
         "typography": round(global_coverage["typography"], 3),
         "details": global_coverage.get("details", {}),
     }
+    # Surface asset upload failures so the quality gate can react to them
+    # instead of them being a console-only signal that developers miss.
+    if ASSET_UPLOAD_FAILURES:
+        report_dict["asset_failures"] = list(ASSET_UPLOAD_FAILURES)
+        risk_areas = report_dict.setdefault("riskAreas", [])
+        risk_areas.append({
+            "kind": "asset_upload",
+            "nodeId": None,
+            "nodeName": None,
+            "severity": "error",
+            "detail": (
+                f"{len(ASSET_UPLOAD_FAILURES)} asset(s) failed to upload. "
+                "Their URLs in _elementor_data still point at local paths; "
+                "the live page will show broken images. See "
+                "import-report.json::asset_failures for the full list."
+            ),
+        })
+        print(
+            f"  ⚠ {len(ASSET_UPLOAD_FAILURES)} asset upload failure(s) recorded "
+            "in import-report.json::asset_failures"
+        )
     (build_dir / "import-report.json").write_text(json.dumps(report_dict, indent=2))
 
     # Save the rewritten `content` so claude_review.py can read the

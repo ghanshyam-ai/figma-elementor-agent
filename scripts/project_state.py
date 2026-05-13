@@ -41,6 +41,11 @@ class ProjectState:
     template_ids_by_slug: dict[str, dict] = field(default_factory=dict)
     form_ids_by_title: dict[str, int] = field(default_factory=dict)
     asset_map_by_filename: dict[str, dict] = field(default_factory=dict)
+    # Content-hash → upload meta. Survives filename churn: the Figma plugin
+    # often regenerates hashed filenames per export ("img_<hash>.png"), so
+    # the same actual file lands under a different name. Dedup keyed by
+    # SHA-256 of file content skips re-uploads in that case.
+    asset_map_by_hash: dict[str, dict] = field(default_factory=dict)
     pages_imported: list[dict] = field(default_factory=list)
 
     # ---- Convenience properties --------------------------------------
@@ -87,7 +92,11 @@ class ProjectState:
     def record_assets(self, asset_map: dict[str, dict]) -> None:
         for fname, meta in (asset_map or {}).items():
             if isinstance(meta, dict) and meta.get("id") and meta.get("url"):
-                self.asset_map_by_filename[fname] = {"id": meta["id"], "url": meta["url"]}
+                entry = {"id": meta["id"], "url": meta["url"]}
+                if meta.get("sha256"):
+                    entry["sha256"] = meta["sha256"]
+                    self.asset_map_by_hash[meta["sha256"]] = entry
+                self.asset_map_by_filename[fname] = entry
 
     def record_page(self, slug: str, page_id: int, permalink: str) -> None:
         self.pages_imported = [p for p in self.pages_imported if p.get("slug") != slug]
@@ -114,6 +123,7 @@ class ProjectState:
             "template_ids_by_slug": self.template_ids_by_slug,
             "form_ids_by_title": self.form_ids_by_title,
             "asset_map_by_filename": self.asset_map_by_filename,
+            "asset_map_by_hash": self.asset_map_by_hash,
             "pages_imported": self.pages_imported,
         }
         self.path.write_text(json.dumps(payload, indent=2, default=str))
@@ -140,6 +150,7 @@ def load_state(repo_root: Path, filename: str = _DEFAULT_FILENAME) -> ProjectSta
     s.template_ids_by_slug = raw.get("template_ids_by_slug") or {}
     s.form_ids_by_title = raw.get("form_ids_by_title") or {}
     s.asset_map_by_filename = raw.get("asset_map_by_filename") or {}
+    s.asset_map_by_hash = raw.get("asset_map_by_hash") or {}
     s.pages_imported = raw.get("pages_imported") or []
     return s
 

@@ -143,6 +143,12 @@ def main() -> int:
                          "Figma section screenshot under build/<export>/screenshots/sections/. "
                          "Per-section drift is added to report.json::sections and gives "
                          "the auto-fixer exact node_ids instead of fuzzy y-band guesses.")
+    ap.add_argument("--dom-diff", action="store_true",
+                    help="Also capture the live DOM and compare its structural "
+                         "fingerprint (widget-type tree + text content) against "
+                         "build/data.json. When the pixel diff fails but DOM is "
+                         "structurally identical the section is treated as PASS "
+                         "(eliminates animation / FOUT / lazy-load false positives).")
     args = ap.parse_args()
 
     cfg = json.loads(Path(args.config).read_text())
@@ -261,6 +267,47 @@ def main() -> int:
             # determines pass/fail. Log and continue.
             print(f"  (per-section diff skipped: {exc})")
             report["sections_error"] = str(exc)
+
+    # --- DOM-structure diff (opt-in) ---------------------------------------
+    # The pixel diff is the primary signal but it can't distinguish a
+    # genuine layout bug from a transient render artefact (FOUT, lazy
+    # image, half-loaded animation). The structural diff acts as a
+    # rescue: if pixel fails but the live DOM has the same widget tree
+    # and text content as the expected build/data.json, the section is
+    # promoted back to PASS. This eliminates a class of false positives
+    # that previously sent good sections to the auto-fixer / Claude.
+    if args.dom_diff:
+        try:
+            from dom_diff import capture_live_dom, expected_dom_from_data_json, diff_dom
+            live_dom = capture_live_dom(page_url, args.width)
+            expected_dom = expected_dom_from_data_json()
+            dom_result = diff_dom(live_dom, expected_dom)
+            report["dom_diff"] = dom_result
+            # Apply rescue rule: for each section with pixel-drift > threshold
+            # AND a DOM-match, mark it as rescued.
+            rescued: list[str] = []
+            sections = report.get("sections") or []
+            dom_by_id = {s.get("data_id"): s for s in dom_result.get("sections", [])}
+            for sec in sections:
+                did = sec.get("data_id")
+                pd = sec.get("drift")
+                if pd is None or pd <= args.threshold:
+                    continue
+                dom_sec = dom_by_id.get(did)
+                if dom_sec and dom_sec.get("passed"):
+                    sec["dom_rescued"] = True
+                    sec["passed"] = True
+                    rescued.append(sec.get("figma_name") or did)
+            if rescued:
+                report["dom_rescued_count"] = len(rescued)
+                print(f"  DOM diff rescued {len(rescued)} section(s) from pixel-only fail: "
+                      f"{', '.join(rescued[:3])}{'…' if len(rescued) > 3 else ''}")
+            else:
+                print(f"  DOM diff: {len(dom_result.get('sections', []))} section(s) checked, "
+                      f"passed={dom_result.get('passed')}")
+        except Exception as exc:
+            print(f"  (DOM diff skipped: {exc})")
+            report["dom_diff_error"] = str(exc)
 
     (BUILD_DIFF / "report.json").write_text(json.dumps(report, indent=2))
 

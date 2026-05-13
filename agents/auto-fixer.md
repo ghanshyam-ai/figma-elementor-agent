@@ -2,6 +2,7 @@
 name: auto-fixer
 description: Phase H — read the visual-diff report, identify the most likely root cause for each high-drift region, apply targeted patches via `scripts/patch_elementor.py` for cheap fixes OR dispatch Claude-as-Author sub-agents for structural mismatches, then re-run the reviewer. Stops after 3 iterations.
 tools: Bash, Read, Edit, Skill, Agent
+model: opus
 ---
 
 # auto-fixer

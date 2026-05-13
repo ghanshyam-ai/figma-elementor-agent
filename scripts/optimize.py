@@ -65,19 +65,20 @@ def resolve_global_tokens(content: list, kit_settings: dict) -> dict:
     Returns counters: {"colors": n, "typography": n}.
     """
     color_index = _build_color_index(kit_settings)
+    lab_index = _build_lab_index(color_index)
     typo_index = _build_typography_index(kit_settings)
 
     counters = {"colors": 0, "typography": 0}
     for node in walk_containers(content):
         for key in CONTAINER_COLOR_KEYS:
-            if _swap_color(node["settings"], key, color_index):
+            if _swap_color(node["settings"], key, color_index, lab_index):
                 counters["colors"] += 1
 
     for w in walk_widgets(content):
         wtype = w.get("widgetType")
         keys = COLOR_KEYS_BY_WIDGET.get(wtype, [])
         for key in list(keys) + ADVANCED_COLOR_KEYS:
-            if _swap_color(w["settings"], key, color_index):
+            if _swap_color(w["settings"], key, color_index, lab_index):
                 counters["colors"] += 1
         if _swap_typography(w["settings"], typo_index):
             counters["typography"] += 1
@@ -98,6 +99,88 @@ def _build_color_index(kit_settings: dict) -> dict[str, str]:
     return out
 
 
+# --- Fuzzy color matching (CIE Lab delta-E) ---------------------------------
+#
+# Exact-hex matching leaves a lot of coverage on the floor: designers
+# routinely use near-duplicate values (#FF0055 vs #FF0054, opacity-stripped
+# rgba) that visually read as the brand color but don't `==` the token. A
+# small delta-E threshold collapses those without producing visible drift
+# (the human eye starts to notice difference at delta-E ≈ 2-3).
+#
+# Default 3.0 is conservative; bump COLOR_DELTAE_THRESHOLD env var to be
+# more aggressive (e.g. 6.0) if your brand guide has loose color tolerance.
+
+_HEX3_RE = __import__("re").compile(r"^#([0-9a-f])([0-9a-f])([0-9a-f])$")
+_HEX6_RE = __import__("re").compile(r"^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$")
+_HEX8_RE = __import__("re").compile(r"^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$")
+COLOR_DELTAE_THRESHOLD = 3.0
+
+
+def _parse_hex(s: str) -> tuple[int, int, int] | None:
+    if not isinstance(s, str):
+        return None
+    v = s.strip().lower()
+    m = _HEX6_RE.match(v) or _HEX8_RE.match(v)
+    if m:
+        return int(m.group(1), 16), int(m.group(2), 16), int(m.group(3), 16)
+    m3 = _HEX3_RE.match(v)
+    if m3:
+        return (int(m3.group(1) * 2, 16), int(m3.group(2) * 2, 16), int(m3.group(3) * 2, 16))
+    return None
+
+
+def _srgb_to_lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
+    """sRGB (0-255) → CIE Lab. Plain D65, no chromatic adaptation."""
+    def to_linear(c: float) -> float:
+        c /= 255.0
+        return ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
+    r, g, b = (to_linear(c) for c in rgb)
+    # sRGB → XYZ (D65)
+    x = (r * 0.4124564 + g * 0.3575761 + b * 0.1804375) / 0.95047
+    y = (r * 0.2126729 + g * 0.7151522 + b * 0.0721750) / 1.00000
+    z = (r * 0.0193339 + g * 0.1191920 + b * 0.9503041) / 1.08883
+
+    def f(t: float) -> float:
+        return t ** (1 / 3) if t > 0.008856 else (7.787 * t + 16 / 116)
+    fx, fy, fz = f(x), f(y), f(z)
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def _delta_e76(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
+def _build_lab_index(color_index: dict[str, str]) -> list[tuple[tuple[float, float, float], str]]:
+    """Lab-space mirror of the exact-hex index for delta-E fallback."""
+    out: list[tuple[tuple[float, float, float], str]] = []
+    for hex_v, ref in color_index.items():
+        rgb = _parse_hex(hex_v)
+        if rgb is None:
+            continue
+        out.append((_srgb_to_lab(rgb), ref))
+    return out
+
+
+def _nearest_color_ref(
+    hex_value: str,
+    lab_index: list[tuple[tuple[float, float, float], str]],
+    threshold: float = COLOR_DELTAE_THRESHOLD,
+) -> str | None:
+    """Return the closest token ref within `threshold` delta-E, or None."""
+    rgb = _parse_hex(hex_value)
+    if rgb is None or not lab_index:
+        return None
+    target = _srgb_to_lab(rgb)
+    best_ref: str | None = None
+    best_d = threshold
+    for lab, ref in lab_index:
+        d = _delta_e76(target, lab)
+        if d <= best_d:
+            best_d = d
+            best_ref = ref
+    return best_ref
+
+
 def _build_typography_index(kit_settings: dict) -> dict[tuple, str]:
     """{(family, size, weight) → 'globals/typography?id=<slug>'}.
 
@@ -112,20 +195,30 @@ def _build_typography_index(kit_settings: dict) -> dict[tuple, str]:
         if not slug:
             continue
         family = t.get("typography_font_family")
-        size = _size_value(t.get("typography_font_size"))
-        weight = t.get("typography_font_weight")
+        size = _canonical_size(t.get("typography_font_size"))
+        weight = _canonical_weight(t.get("typography_font_weight"))
         if family and size is not None:
-            out[(family, size, str(weight) if weight is not None else None)] = (
-                f"globals/typography?id={slug}"
-            )
+            out[(family, size, weight)] = f"globals/typography?id={slug}"
     return out
 
 
-def _swap_color(settings: dict, key: str, index: dict[str, str]) -> bool:
+def _swap_color(
+    settings: dict,
+    key: str,
+    index: dict[str, str],
+    lab_index: list[tuple[tuple[float, float, float], str]] | None = None,
+) -> bool:
     val = settings.get(key)
     if not isinstance(val, str):
         return False
-    ref = index.get(val.lower().strip())
+    norm = val.lower().strip()
+    ref = index.get(norm)
+    if not ref and lab_index:
+        # Fall back to nearest-neighbor in Lab space. Catches near-duplicate
+        # design values (#FF0055 vs #FF0054, slight opacity drift) that
+        # exact-hex matching misses — the dominant cause of low global
+        # coverage on real-world Figma files.
+        ref = _nearest_color_ref(norm, lab_index)
     if not ref:
         return False
     settings[key] = ""
@@ -133,21 +226,64 @@ def _swap_color(settings: dict, key: str, index: dict[str, str]) -> bool:
     return True
 
 
+# Typography weight aliases — Figma exports often carry CSS keyword
+# weights, but Elementor kit presets store numeric weights. Without
+# canonicalization, "bold" → 700 never matches.
+_FONT_WEIGHT_ALIASES = {
+    "thin": "100", "hairline": "100",
+    "extralight": "200", "ultralight": "200",
+    "light": "300",
+    "regular": "400", "normal": "400", "book": "400",
+    "medium": "500",
+    "semibold": "600", "semi-bold": "600", "demibold": "600", "demi-bold": "600",
+    "bold": "700",
+    "extrabold": "800", "ultrabold": "800",
+    "black": "900", "heavy": "900",
+}
+
+
+def _canonical_weight(w: object) -> str | None:
+    if w is None or w == "":
+        return None
+    if isinstance(w, (int, float)):
+        return str(int(w))
+    if isinstance(w, str):
+        s = w.strip().lower().replace(" ", "")
+        if s.isdigit():
+            return s
+        return _FONT_WEIGHT_ALIASES.get(s, s)
+    return None
+
+
+def _canonical_size(v) -> float | None:
+    """Round to nearest int px. Per-widget half-pixel tweaks (15px vs 16px)
+    shouldn't blow up token matching — the font preset is the same."""
+    s = _size_value(v)
+    return None if s is None else float(round(s))
+
+
 def _swap_typography(settings: dict, index: dict[tuple, str]) -> bool:
     if settings.get("typography_typography") == "globals":
         return False  # already linked
     family = settings.get("typography_font_family")
-    size = _size_value(settings.get("typography_font_size"))
-    weight = settings.get("typography_font_weight")
+    size = _canonical_size(settings.get("typography_font_size"))
+    weight = _canonical_weight(settings.get("typography_font_weight"))
     if not family or size is None:
         return False
-    key = (family, size, str(weight) if weight is not None else None)
+    key = (family, size, weight)
     ref = index.get(key)
     if not ref:
         # Fall back: match on family+size, ignoring weight. Useful when the
         # widget lacks a weight but matches a preset that has one.
         for (f, s, _w), r in index.items():
             if f == family and s == size:
+                ref = r
+                break
+    if not ref:
+        # Last-resort: family-only fallback for body text where size varies
+        # across widgets (body-12, body-14, body-16 sharing one family).
+        for (f, _s, _w), r in index.items():
+            if f == family:
                 ref = r
                 break
     if not ref:
@@ -381,19 +517,55 @@ def _zip_top_level(content: list, e: Enrichment) -> list[tuple[dict, dict]]:
 
 
 def _looks_like_icon_list(el: dict) -> bool:
-    """Heuristic: a container whose children are all icon+text pairs."""
+    """Heuristic: a container whose children are all icon+text pairs.
+
+    Reject rows of bare image widgets (brand-logo strips, partner grids):
+    those should remain a horizontal container of `image` widgets, NOT
+    collapse into a single text-only icon-list that drops the artwork.
+    """
     rows = el.get("elements") or []
     if len(rows) < 2:
         return False
+    # First: count direct-child image widgets. A row of N images with no
+    # text-bearing siblings is a logo strip, not an icon-list.
+    direct_images = sum(
+        1 for r in rows
+        if isinstance(r, dict)
+        and r.get("elType") == "widget"
+        and r.get("widgetType") == "image"
+    )
+    if direct_images >= max(2, len(rows) // 2):
+        return False
     icon_text_rows = 0
+    icon_only_rows = 0  # icon/image but no accompanying text → suspicious
     for r in rows:
         if not isinstance(r, dict) or r.get("elType") != "container":
             continue
         kids = r.get("elements") or []
-        has_icon = any(c.get("widgetType") in ("icon", "image") for c in kids if isinstance(c, dict))
-        has_text = any(c.get("widgetType") in ("heading", "text-editor") for c in kids if isinstance(c, dict))
-        if has_icon and has_text:
+        has_icon = any(
+            c.get("widgetType") == "icon"
+            for c in kids if isinstance(c, dict)
+        )
+        # An image alone (no `icon` widget, no text) marks a logo cell.
+        has_image_no_text = (
+            any(c.get("widgetType") == "image" for c in kids if isinstance(c, dict))
+            and not any(
+                c.get("widgetType") in ("heading", "text-editor")
+                for c in kids if isinstance(c, dict)
+            )
+        )
+        has_text = any(
+            c.get("widgetType") in ("heading", "text-editor")
+            for c in kids if isinstance(c, dict)
+        )
+        if has_image_no_text and not has_icon:
+            icon_only_rows += 1
+            continue
+        if (has_icon or any(c.get("widgetType") == "image" for c in kids if isinstance(c, dict))) and has_text:
             icon_text_rows += 1
+    # If most rows are image-only (logos), this isn't an icon-list.
+    if icon_only_rows >= max(2, len(rows) // 2):
+        return False
     return icon_text_rows >= 2 and icon_text_rows >= len(rows) // 2
 
 
@@ -670,32 +842,74 @@ def _convert_to_slides(el: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 NUMBER_RE = __import__("re").compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*([A-Za-z%+]*)\s*$")
+# Stricter counter pattern: positive number, optional unit/suffix (K, M, B,
+# %, +). Rejects currency-prefixed values, fractions like "4.8/5", and
+# anything with whitespace inside (which would indicate a multi-word
+# heading that just happens to start with a digit).
+COUNTER_NUM_RE = __import__("re").compile(r"^\s*(\d+(?:\.\d+)?)\s*([KkMmBb]?[+%]?)\s*$")
+
+
+def _extract_counter_value(title: str) -> tuple[str, str] | None:
+    """Parse a counter heading title.
+
+    Returns (value, suffix) on success, None when the title doesn't look
+    like a counter value at all. Pulled out so both the detector and the
+    converter use the exact same logic — they can never disagree.
+    """
+    if not isinstance(title, str):
+        return None
+    m = COUNTER_NUM_RE.match(title)
+    if not m:
+        return None
+    value, suffix = m.group(1), m.group(2)
+    # Belt-and-braces: the regex permits "" suffix, but the value must
+    # itself be parseable as a float.
+    try:
+        float(value)
+    except ValueError:
+        return None
+    return value, suffix
 
 
 def _looks_like_counter(el: dict) -> bool:
     kids = el.get("elements") or []
     if len(kids) not in (2, 3):
         return False
-    # First child is a heading whose text is mostly numeric
+    # First child is a heading whose text is a clean numeric value.
     h = kids[0] if isinstance(kids[0], dict) else None
     if not h or h.get("widgetType") != "heading":
         return False
     title = (h.get("settings") or {}).get("title") or ""
-    return bool(NUMBER_RE.match(title))
+    if _extract_counter_value(title) is None:
+        return False
+    # Sanity: the remaining children should be labels (text-editor or
+    # heading), not nested containers carrying more structural content.
+    for k in kids[1:]:
+        if not isinstance(k, dict):
+            return False
+        if k.get("elType") == "container":
+            return False
+    return True
 
 
 def _convert_to_counter(el: dict) -> bool:
     kids = el.get("elements") or []
-    h = kids[0]
-    title = (h.get("settings") or {}).get("title") or ""
-    m = NUMBER_RE.match(title)
-    if not m:
+    if not kids or not isinstance(kids[0], dict):
         return False
-    value, suffix = m.group(1), m.group(2)
+    title = (kids[0].get("settings") or {}).get("title") or ""
+    parsed = _extract_counter_value(title)
+    if parsed is None:
+        # Detector promised this was a counter; if extraction now fails,
+        # bail without mutating — leaving an empty widget shell is worse
+        # than skipping the conversion.
+        return False
+    value, suffix = parsed
     label = ""
     if len(kids) >= 2 and isinstance(kids[1], dict):
         s2 = kids[1].get("settings") or {}
         label = s2.get("title") or s2.get("editor") or ""
+        if isinstance(label, str):
+            label = label.replace("<p>", "").replace("</p>", "").strip()
     el.clear()
     el["id"] = "cnter" + value[-3:].zfill(3)
     el["elType"] = "widget"
@@ -716,30 +930,41 @@ def _convert_to_counter(el: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 PCT_RE = __import__("re").compile(r"(\d{1,3})\s*%")
+PCT_ONLY_RE = __import__("re").compile(r"^\s*\d{1,3}\s*%\s*$")
 
 
 def _looks_like_progress(el: dict) -> bool:
-    """Heading with a label + a child containing a percentage value."""
+    """A simple two-child row: one label + one bare percentage value.
+
+    Deliberately strict — a real Elementor progress bar holds exactly one
+    label and one numeric percent. A pricing grid, "20% off" promo card,
+    or any multi-tier layout that happens to contain a percentage
+    somewhere in its subtree must NOT match (would collapse into a single
+    progress widget and erase the rest of the section).
+    """
     kids = el.get("elements") or []
-    if len(kids) < 1:
+    if len(kids) != 2:
         return False
-    has_pct = False
-    has_label = False
-    def walk(n):
-        nonlocal has_pct, has_label
-        if not isinstance(n, dict):
-            return
-        s = n.get("settings") or {}
-        text = s.get("title") or s.get("editor") or s.get("text") or ""
-        if isinstance(text, str):
-            if PCT_RE.search(text):
-                has_pct = True
-            elif text.strip():
-                has_label = True
-        for c in n.get("elements") or []:
-            walk(c)
-    walk(el)
-    return has_pct and has_label
+    # Reject if either immediate child is a container with multiple
+    # children — that's structural content, not a progress label.
+    for k in kids:
+        if not isinstance(k, dict):
+            return False
+        if k.get("elType") == "container" and len(k.get("elements") or []) > 1:
+            return False
+    texts: list[str] = []
+    for k in kids:
+        s = k.get("settings") or {}
+        t = s.get("title") or s.get("editor") or s.get("text") or ""
+        if isinstance(t, str):
+            # Strip simple HTML wrappers that text-editor adds.
+            t = t.replace("<p>", "").replace("</p>", "").strip()
+            texts.append(t)
+    if len(texts) != 2:
+        return False
+    pcts = [t for t in texts if PCT_ONLY_RE.match(t)]
+    labels = [t for t in texts if t and t not in pcts]
+    return len(pcts) == 1 and len(labels) == 1
 
 
 def _convert_to_progress(el: dict) -> bool:
@@ -1121,59 +1346,203 @@ def _scale_font(size_dict: dict, scale: float, min_px: int) -> dict | None:
     return out
 
 
+def _scale_box(box: dict, factor: float, floor: int = 0) -> dict | None:
+    """Scale a four-side box (padding / margin) dict by `factor`.
+
+    Elementor stores these as {"unit","top","right","bottom","left","isLinked"}
+    where each side is a stringified number. Returns None when the input
+    isn't a recognisable box dict.
+    """
+    if not isinstance(box, dict):
+        return None
+    def s(v):
+        try:
+            return str(max(floor, int(round(float(v) * factor))))
+        except (TypeError, ValueError):
+            return v
+    return {
+        "unit": box.get("unit", "px"),
+        "top": s(box.get("top", "0")),
+        "right": s(box.get("right", "0")),
+        "bottom": s(box.get("bottom", "0")),
+        "left": s(box.get("left", "0")),
+        "isLinked": box.get("isLinked", False),
+    }
+
+
+def _scale_unit_size(size_dict: dict, factor: float, floor: float = 0) -> dict | None:
+    """Scale an Elementor size dict ({size, unit, sizes}) by `factor`.
+
+    Returns None when not a numeric size or the result would round to 0.
+    """
+    if not isinstance(size_dict, dict):
+        return None
+    s = size_dict.get("size")
+    if not isinstance(s, (int, float)):
+        return None
+    new = max(floor, round(float(s) * factor))
+    out = dict(size_dict)
+    out["size"] = new
+    return out
+
+
+def _count_significant_children(container: dict) -> int:
+    """Direct-child count, ignoring spacer/divider widgets used as gaps."""
+    n = 0
+    for c in container.get("elements") or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("elType") == "container":
+            n += 1
+        elif c.get("elType") == "widget" and c.get("widgetType") not in ("spacer", "divider"):
+            n += 1
+    return n
+
+
+def _looks_like_row(container: dict) -> bool:
+    """A container is a 'row' when its flex direction is row (the Elementor
+    default for `e-con`) AND it has ≥2 significant children. These are the
+    nodes that genuinely need stacking on small screens — single-child
+    columns don't.
+    """
+    s = container.get("settings") or {}
+    direction = s.get("flex_direction") or "row"
+    if direction not in ("row", "row-reverse"):
+        return False
+    return _count_significant_children(container) >= 2
+
+
 def apply_responsive_defaults(content: list) -> dict:
-    """Stamp `_mobile` / `_tablet` overrides onto containers + headings.
+    """Stamp `_mobile` / `_tablet` overrides so the live page reflows for
+    small screens even when the Figma plugin export contains no responsive
+    data (which is the common case today).
 
-    For every container:
-      • `flex_direction_mobile = "column"`  (stack on mobile)
-      • `flex_wrap_mobile = "wrap"`         (allow wrap on mobile)
-      • `padding_mobile` shrinks padding to ~60% of desktop
+    Rules — all idempotent, every key is a no-op when already set:
 
-    For every heading / text widget whose typography_font_size > 32px:
+    Container, multi-column row (≥2 children, direction=row):
+      • `flex_direction_mobile = "column"` — stack on mobile
+      • `flex_direction_tablet = "column"` — also stack on tablet when
+        the row has ≥3 columns (4-up grids are unreadable on tablet)
+      • `flex_wrap_mobile  = "wrap"`
+      • `flex_wrap_tablet  = "wrap"`
+      • `flex_gap_mobile / _tablet` — shrink gap proportionally
+      • `width_mobile = "100"` (full bleed) when desktop width was % or px
+
+    Container, any:
+      • `padding_mobile`  — scale to 60% of desktop, 8px floor
+      • `padding_tablet`  — scale to 80% of desktop
+      • `min_height_mobile / _tablet` — scale, 0px floor (lets content set)
+
+    Heading / text / button widget where size > 32px:
       • `typography_font_size_mobile = max(16, size * 0.58)`
       • `typography_font_size_tablet = max(16, size * 0.75)`
 
-    These are no-ops on settings that already exist — running this twice
-    will not overwrite manual values.
+    Image widget:
+      • `width_mobile = {"unit":"%","size":100}` so logos don't overflow
+
+    Button widget:
+      • `align_mobile = "justify"` — full-width buttons on mobile reduce
+        accidental misses and match modern responsive UX. Skipped when
+        the user explicitly set `align` or already has `align_mobile`.
+
+    The pass tags every node it modifies with `_responsive_defaulted: true`
+    in settings so downstream tools (claude-review, fix_history) know the
+    breakpoint values came from heuristics, not the design.
     """
-    stats = {"containers": 0, "headings": 0}
+    stats = {"containers": 0, "rows": 0, "headings": 0, "images": 0, "buttons": 0}
 
     def visit(node: dict) -> None:
         if not isinstance(node, dict):
             return
+
         if node.get("elType") == "container":
             s = node.setdefault("settings", {})
-            if "flex_direction_mobile" not in s:
-                s["flex_direction_mobile"] = "column"
-            if "flex_wrap_mobile" not in s:
-                s["flex_wrap_mobile"] = "wrap"
+            cols = _count_significant_children(node)
+            is_row = _looks_like_row(node)
+
+            # Stacking direction
+            if is_row:
+                if "flex_direction_mobile" not in s:
+                    s["flex_direction_mobile"] = "column"
+                if "flex_wrap_mobile" not in s:
+                    s["flex_wrap_mobile"] = "wrap"
+                # Tablet stacking only when the desktop layout is ≥3 columns
+                # — 2-column rows usually still fit at tablet widths.
+                if cols >= 3 and "flex_direction_tablet" not in s:
+                    s["flex_direction_tablet"] = "column"
+                    s.setdefault("flex_wrap_tablet", "wrap")
+                stats["rows"] += 1
+
+            # Padding scaling (both breakpoints)
             pad = s.get("padding")
-            if isinstance(pad, dict) and "padding_mobile" not in s:
-                def shrink(v):
-                    try:
-                        return str(max(8, int(float(v) * 0.6)))
-                    except (TypeError, ValueError):
-                        return v
-                s["padding_mobile"] = {
-                    "unit": pad.get("unit", "px"),
-                    "top": shrink(pad.get("top", "0")),
-                    "right": shrink(pad.get("right", "0")),
-                    "bottom": shrink(pad.get("bottom", "0")),
-                    "left": shrink(pad.get("left", "0")),
-                    "isLinked": pad.get("isLinked", False),
-                }
+            if isinstance(pad, dict):
+                if "padding_mobile" not in s:
+                    scaled = _scale_box(pad, 0.6, floor=8)
+                    if scaled:
+                        s["padding_mobile"] = scaled
+                if "padding_tablet" not in s:
+                    scaled = _scale_box(pad, 0.8, floor=8)
+                    if scaled:
+                        s["padding_tablet"] = scaled
+
+            # Flex gap scaling — only meaningful on flex containers
+            gap = s.get("flex_gap")
+            if isinstance(gap, dict):
+                if "flex_gap_mobile" not in s:
+                    sg = _scale_unit_size(gap, 0.6, floor=0)
+                    if sg:
+                        s["flex_gap_mobile"] = sg
+                if "flex_gap_tablet" not in s:
+                    sg = _scale_unit_size(gap, 0.8, floor=0)
+                    if sg:
+                        s["flex_gap_tablet"] = sg
+
+            # Min-height scaling — hero/banner sections often set a tall
+            # min_height for desktop that crops content on mobile.
+            mh = s.get("min_height")
+            if isinstance(mh, dict):
+                if "min_height_mobile" not in s:
+                    sm = _scale_unit_size(mh, 0.5)
+                    if sm:
+                        s["min_height_mobile"] = sm
+                if "min_height_tablet" not in s:
+                    sm = _scale_unit_size(mh, 0.75)
+                    if sm:
+                        s["min_height_tablet"] = sm
+
+            s["_responsive_defaulted"] = True
             stats["containers"] += 1
-        if node.get("elType") == "widget" and node.get("widgetType") in ("heading", "text-editor", "button"):
+
+        if node.get("elType") == "widget":
+            wtype = node.get("widgetType")
             s = node.setdefault("settings", {})
-            base = s.get("typography_font_size")
-            if isinstance(base, dict):
-                mobile = _scale_font(base, _MOBILE_FONT_SCALE, _MIN_MOBILE_FONT)
-                tablet = _scale_font(base, _TABLET_FONT_SCALE, _MIN_MOBILE_FONT)
-                if mobile and "typography_font_size_mobile" not in s:
-                    s["typography_font_size_mobile"] = mobile
-                    stats["headings"] += 1
-                if tablet and "typography_font_size_tablet" not in s:
-                    s["typography_font_size_tablet"] = tablet
+
+            if wtype in ("heading", "text-editor", "button"):
+                base = s.get("typography_font_size")
+                if isinstance(base, dict):
+                    mobile = _scale_font(base, _MOBILE_FONT_SCALE, _MIN_MOBILE_FONT)
+                    tablet = _scale_font(base, _TABLET_FONT_SCALE, _MIN_MOBILE_FONT)
+                    if mobile and "typography_font_size_mobile" not in s:
+                        s["typography_font_size_mobile"] = mobile
+                        stats["headings"] += 1
+                    if tablet and "typography_font_size_tablet" not in s:
+                        s["typography_font_size_tablet"] = tablet
+
+            if wtype == "image":
+                # Force images to 100% width on mobile so brand logos /
+                # hero shots scale instead of overflowing the viewport.
+                if "width_mobile" not in s:
+                    s["width_mobile"] = {"unit": "%", "size": 100, "sizes": []}
+                    stats["images"] += 1
+
+            if wtype == "button":
+                # Modern responsive UX: full-width CTA on mobile. Honour
+                # any explicit `align` the user set — this is a default,
+                # not a forced override.
+                if "align_mobile" not in s and not s.get("align"):
+                    s["align_mobile"] = "justify"
+                    stats["buttons"] += 1
+
         for c in node.get("elements") or []:
             visit(c)
 

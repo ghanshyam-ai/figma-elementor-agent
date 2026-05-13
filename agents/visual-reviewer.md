@@ -1,7 +1,8 @@
 ---
 name: visual-reviewer
-description: Phase G — render the live page with Playwright, diff against the Figma screenshot, and produce `build/diff/{live,expected,diff}.png` + `report.json`.
+description: Phase G — render the live page with Playwright, diff against the Figma screenshot, and produce `build/diff/{live,expected,diff}.png` + `report.json`. Uses both pixel diff and DOM-structure diff to avoid animation / FOUT / lazy-image false positives.
 tools: Bash, Read, Skill
+model: opus
 ---
 
 # visual-reviewer

@@ -50,6 +50,57 @@ MAX_DISPATCHES = 5
 DEFAULT_CONFIDENCE_FLOOR = 0.6
 DEFAULT_DRIFT_CEILING = 0.15
 
+# Section-purpose weights — higher means "more likely to be worth a
+# dispatch slot when budget is tight". Tuned so hero/pricing always
+# beat generic feature-grid sections; chrome (header/footer) gets a
+# huge boost because errors there propagate to every page.
+SECTION_PURPOSE_WEIGHTS: dict[str, float] = {
+    "header":         1.6,
+    "footer":         1.6,
+    "hero":           1.4,
+    "pricing":        1.4,
+    "cta":            1.3,
+    "navigation":     1.3,
+    "form":           1.2,
+    "testimonial":    1.1,
+    "feature-grid":   1.0,
+    "feature":        1.0,
+    "trust-row":      0.9,
+    "stats":          0.9,
+    "logo-strip":     0.7,
+    "spacer":         0.5,
+    "unknown":        1.0,
+}
+
+# Severity score weights — drift and confidence-deficit contribute
+# directly; combined with purpose weight at the end.
+WEIGHT_DRIFT = 0.6
+WEIGHT_CONFIDENCE_DEFICIT = 0.4
+
+# First-run vs Nth-run budgets — the orchestrator passes `prior_runs`
+# (count of successful archived runs for this slug). The first build
+# of a fresh design gets a higher dispatch budget; later runs lean on
+# fix_history and need fewer slots.
+FIRST_RUN_DISPATCHES = 8
+INCREMENTAL_DISPATCHES = 3
+FIRST_RUN_CONFIDENCE_FLOOR = 0.7
+INCREMENTAL_CONFIDENCE_FLOOR = 0.55
+FIRST_RUN_DRIFT_CEILING = 0.12
+INCREMENTAL_DRIFT_CEILING = 0.18
+
+
+def adaptive_budget(prior_runs: int) -> tuple[int, float, float]:
+    """Return (max_dispatches, confidence_floor, drift_ceiling) tuned to
+    whether this is the first build of the design or an incremental run.
+
+    First runs: more aggressive review (high budget, tighter floors)
+    because we don't yet have a fix_history cache or prior gate to lean
+    on. Nth runs: smaller budget, looser thresholds — the cache handles
+    most of what would otherwise need review."""
+    if prior_runs <= 0:
+        return (FIRST_RUN_DISPATCHES, FIRST_RUN_CONFIDENCE_FLOOR, FIRST_RUN_DRIFT_CEILING)
+    return (INCREMENTAL_DISPATCHES, INCREMENTAL_CONFIDENCE_FLOOR, INCREMENTAL_DRIFT_CEILING)
+
 
 def build_queue_from_plan(
     confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
@@ -145,67 +196,165 @@ def build_queue(
     confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
     drift_ceiling: float = DEFAULT_DRIFT_CEILING,
     max_dispatches: int = MAX_DISPATCHES,
+    prior_runs: int | None = None,
 ) -> list[dict]:
     """Compile the list of sections that need a Claude review.
 
     Inputs (all under `build/`):
       • import-report.json — confidence scores + risk areas
-      • diff/report.json — per-region drift (when visual-reviewer has run)
-      • state.json — export_dir, placements_summary, post-regen id_map
+      • diff/report.json — per-region + per-section drift
+      • state.json — export_dir, placements_summary
+      • id_map.json — pre-regen → post-regen Elementor ids
+
+    Scoring is a priority queue, not a hard threshold:
+      severity = w_drift * drift + w_conf * (1 - confidence)
+      score    = severity * section_purpose_weight
+
+    This eliminates the "14% drift / 0.72 confidence dead band" — every
+    section gets a score, the top N (where N is the budget) win the
+    dispatch slots. A section with drift just under the ceiling that
+    happens to be a hero will still get reviewed; a 0.5%-drift logo
+    strip will not.
+
+    When `prior_runs` is provided, the budget and thresholds adapt to
+    incremental builds — see `adaptive_budget()`.
 
     Returns a list of bundle dicts (highest priority first), capped at
-    `max_dispatches`. Each bundle is also written to disk.
+    the budget. Each bundle is also written to disk.
     """
     state = _load(BUILD / "state.json")
     import_report = _load(BUILD / "import-report.json")
     diff_report = _load(BUILD / "diff" / "report.json")
     export_dir = Path(state.get("export_dir") or BUILD / "export")
 
+    if prior_runs is not None:
+        ab = adaptive_budget(prior_runs)
+        max_dispatches = ab[0]
+        confidence_floor = ab[1]
+        drift_ceiling = ab[2]
+
     REVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
-    candidates: list[dict] = []
+    # Build a {node_id → section_kind} lookup once. Per-section drift
+    # entries carry data_id (post-regen) + figma_name; ai-layout carries
+    # role / sectionPurpose. Stitch the two so each candidate gets a
+    # section_kind for purpose weighting.
+    section_kind_by_node = _build_section_kind_lookup(export_dir, state)
+
+    candidates: dict[str, dict] = {}  # keyed by node_id (or y_band str)
+
+    def upsert(key: str, **fields) -> dict:
+        existing = candidates.get(key)
+        if existing is None:
+            existing = candidates[key] = fields
+        else:
+            # Merge — drift wins on max, confidence on min.
+            if fields.get("drift") is not None:
+                cur = existing.get("drift")
+                existing["drift"] = max(cur or 0.0, fields["drift"])
+            if fields.get("confidence") is not None:
+                cur = existing.get("confidence")
+                existing["confidence"] = min(cur if cur is not None else 1.0, fields["confidence"])
+            for k, v in fields.items():
+                if k in ("drift", "confidence"):
+                    continue
+                existing.setdefault(k, v)
+        return existing
 
     # --- Source 1: low-confidence risk areas ---
     for risk in (import_report.get("riskAreas") or []):
         if risk.get("kind") != "low-confidence":
             continue
         detail = risk.get("detail") or ""
-        # `confidence=0.35` parsing
         conf = _parse_confidence(detail)
-        if conf is not None and conf >= confidence_floor:
-            continue
-        candidates.append({
-            "source": "low-confidence",
-            "node_id": risk.get("nodeId"),
-            "node_name": risk.get("nodeName"),
-            "confidence": conf,
-            "drift": None,
-            "reason": f"confidence={conf:.2f}" if conf is not None else "no-confidence-score",
-            "severity": risk.get("severity") or "warn",
-            "_score": (1.0 - (conf or 0.0)),
-        })
+        node_id = risk.get("nodeId") or f"_risk_{len(candidates)}"
+        upsert(
+            node_id,
+            source="low-confidence",
+            node_id=risk.get("nodeId"),
+            node_name=risk.get("nodeName"),
+            confidence=conf,
+            drift=None,
+            severity=risk.get("severity") or "warn",
+        )
 
-    # --- Source 2: visual-diff regions with drift > ceiling ---
-    for region in (diff_report.get("regions") or []):
-        drift = region.get("drift") or 0.0
-        if drift < drift_ceiling:
+    # --- Source 2: per-section drift (preferred) ---
+    sections = diff_report.get("sections") or []
+    for sec in sections:
+        # Skip sections that the DOM-structure diff rescued — pixel
+        # drift is misleading there (animation / FOUT / lazy load).
+        if sec.get("dom_rescued") or sec.get("passed") is True:
             continue
-        candidates.append({
-            "source": "visual-diff",
-            "node_id": None,
-            "y_band": [region.get("y0"), region.get("y1")],
-            "drift": drift,
-            "confidence": None,
-            "reason": f"drift={drift*100:.1f}%",
-            "severity": "error" if drift > 0.5 else "warn",
-            "_score": drift,
-        })
+        drift = sec.get("drift")
+        if drift is None:
+            continue
+        node_id = sec.get("data_id") or f"_section_{len(candidates)}"
+        upsert(
+            node_id,
+            source="per-section-diff",
+            node_id=sec.get("data_id"),
+            node_name=sec.get("figma_name"),
+            drift=drift,
+            confidence=None,
+            severity="error" if drift > 0.5 else "warn",
+        )
 
-    # Sort by score desc; cap at max_dispatches.
-    candidates.sort(key=lambda c: -c["_score"])
-    candidates = candidates[:max_dispatches]
-    for c in candidates:
+    # --- Source 3: legacy band-level regions (fallback only) ---
+    if not sections:
+        for region in (diff_report.get("regions") or []):
+            drift = region.get("drift") or 0.0
+            key = f"_y{region.get('y0')}-{region.get('y1')}"
+            upsert(
+                key,
+                source="visual-diff",
+                node_id=None,
+                y_band=[region.get("y0"), region.get("y1")],
+                drift=drift,
+                confidence=None,
+                severity="error" if drift > 0.5 else "warn",
+            )
+
+    # --- Filter to candidates that exceed at least one threshold ---
+    pool: list[dict] = []
+    for c in candidates.values():
+        drift = c.get("drift") or 0.0
+        conf = c.get("confidence")
+        passes_drift = drift >= drift_ceiling
+        passes_conf = conf is not None and conf < confidence_floor
+        if not (passes_drift or passes_conf):
+            continue
+        pool.append(c)
+
+    # --- Score and prioritize ---
+    for c in pool:
+        drift = c.get("drift") or 0.0
+        conf = c.get("confidence")
+        deficit = (1.0 - conf) if conf is not None else 0.0
+        severity_score = WEIGHT_DRIFT * drift + WEIGHT_CONFIDENCE_DEFICIT * deficit
+        kind = (
+            section_kind_by_node.get(c.get("node_id"))
+            or _purpose_from_name(c.get("node_name"))
+            or "unknown"
+        )
+        purpose_weight = SECTION_PURPOSE_WEIGHTS.get(kind, 1.0)
+        c["_score"] = severity_score * purpose_weight
+        c["_kind_inferred"] = kind
+        # Reason string for telemetry.
+        bits = []
+        if drift:
+            bits.append(f"drift={drift*100:.1f}%")
+        if conf is not None:
+            bits.append(f"confidence={conf:.2f}")
+        bits.append(f"kind={kind}")
+        bits.append(f"weight={purpose_weight}")
+        c["reason"] = " ".join(bits)
+
+    candidates_list = sorted(pool, key=lambda c: -c["_score"])
+    candidates_list = candidates_list[:max_dispatches]
+    for c in candidates_list:
         c.pop("_score", None)
+        c.pop("_kind_inferred", None)
+    candidates = candidates_list  # type: ignore[assignment]
 
     # --- Materialize each candidate as a bundle file ---
     bundles: list[dict] = []
@@ -314,6 +463,104 @@ def _load(p: Path) -> dict:
         return json.loads(p.read_text())
     except json.JSONDecodeError:
         return {}
+
+
+def _build_section_kind_lookup(export_dir: Path, state: dict) -> dict[str, str]:
+    """{node_id (post-regen) → section_kind} so per-section drift entries
+    can be weighted by their purpose. The lookup chains:
+        live data-id (post-regen)
+          → id_map (post → pre)
+          → build/data.json _figma_id
+          → ai-layout role / sectionPurpose
+    Best-effort; sections without a recoverable kind get "unknown".
+    """
+    id_map = _load(BUILD / "id_map.json")
+    if not isinstance(id_map, dict):
+        return {}
+    # id_map is {pre: post} after my marker fix — invert.
+    post_to_pre = {post: pre for pre, post in id_map.items()}
+
+    data = _load(BUILD / "data.json")
+    content = data.get("content") if isinstance(data, dict) else data
+    figma_id_by_pre: dict[str, str] = {}
+    figma_name_by_pre: dict[str, str] = {}
+
+    def collect(n):
+        if isinstance(n, dict):
+            nid = n.get("id")
+            s = n.get("settings") or {}
+            if nid:
+                fid = s.get("_figma_id")
+                fname = s.get("_figma_name") or s.get("_figma_section_name")
+                if fid:
+                    figma_id_by_pre[nid] = fid
+                if fname:
+                    figma_name_by_pre[nid] = fname
+            for c in n.get("elements") or []:
+                collect(c)
+    if isinstance(content, list):
+        for top in content:
+            collect(top)
+
+    # Walk ai-layout once to build {figma_id: role} and {name_lower: role}.
+    ai_path = export_dir / "ai-layout.json"
+    role_by_figma_id: dict[str, str] = {}
+    role_by_name: dict[str, str] = {}
+    if ai_path.exists():
+        try:
+            ai = json.loads(ai_path.read_text())
+        except json.JSONDecodeError:
+            ai = {}
+
+        def walk_ai(sec):
+            if not isinstance(sec, dict):
+                return
+            role = sec.get("role") or sec.get("sectionPurpose") or sec.get("_figma_section_purpose")
+            if role:
+                if sec.get("id"):
+                    role_by_figma_id[sec["id"]] = role
+                if sec.get("name"):
+                    role_by_name[sec["name"].strip().lower()] = role
+            for c in sec.get("children") or []:
+                walk_ai(c)
+        for top in ai.get("sections") or []:
+            walk_ai(top)
+
+    out: dict[str, str] = {}
+    for post, pre in post_to_pre.items():
+        fid = figma_id_by_pre.get(pre)
+        fname = (figma_name_by_pre.get(pre) or "").strip().lower()
+        role = role_by_figma_id.get(fid or "") or role_by_name.get(fname)
+        if not role:
+            role = _purpose_from_name(fname)
+        if role:
+            out[post] = role
+    return out
+
+
+def _purpose_from_name(name: str | None) -> str | None:
+    """Heuristic name → purpose mapping as a last resort. Only fires when
+    ai-layout doesn't carry an explicit role for the section."""
+    if not name:
+        return None
+    n = name.lower()
+    keywords = [
+        ("header", "header"), ("navbar", "header"), ("navigation", "navigation"),
+        ("footer", "footer"),
+        ("hero", "hero"), ("banner", "hero"), ("intro", "hero"),
+        ("pricing", "pricing"), ("plans", "pricing"), ("tiers", "pricing"),
+        ("cta", "cta"), ("call to action", "cta"), ("call-to-action", "cta"),
+        ("testimonial", "testimonial"), ("review", "testimonial"),
+        ("feature", "feature-grid"), ("services", "feature-grid"),
+        ("trust", "trust-row"), ("partners", "trust-row"), ("clients", "trust-row"),
+        ("stats", "stats"), ("metrics", "stats"), ("numbers", "stats"),
+        ("logo", "logo-strip"),
+        ("form", "form"), ("contact", "form"), ("signup", "form"),
+    ]
+    for needle, role in keywords:
+        if needle in n:
+            return role
+    return None
 
 
 def _parse_confidence(detail: str) -> float | None:
@@ -451,6 +698,11 @@ def main() -> int:
     ap.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE_FLOOR)
     ap.add_argument("--drift", type=float, default=DEFAULT_DRIFT_CEILING)
     ap.add_argument("--max", type=int, default=MAX_DISPATCHES)
+    ap.add_argument("--prior-runs", type=int, default=None,
+                    help="Number of prior successful runs for this slug. "
+                         "When supplied, overrides --max / --confidence / --drift "
+                         "with the adaptive budget (first-run aggressive, "
+                         "Nth-run conservative — fix_history covers the rest).")
     args = ap.parse_args()
 
     if args.list:
@@ -479,7 +731,7 @@ def main() -> int:
         return 0
 
     if args.build:
-        bundles = build_queue(args.confidence, args.drift, args.max)
+        bundles = build_queue(args.confidence, args.drift, args.max, prior_runs=args.prior_runs)
         if not bundles:
             print("✓ No sections need Claude review (all above confidence + below drift).")
             return 0

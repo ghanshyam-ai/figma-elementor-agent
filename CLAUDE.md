@@ -149,6 +149,24 @@ feature lists are intentionally removed — Elementor JSON is the source of trut
 
 ## Claude-as-Author pattern (high-quality builds)
 
+**Model policy:** Claude-as-Author dispatches, the visual-reviewer
+agent, and the auto-fixer all run on **Opus 4.7** by default.
+Multimodal reasoning about design fidelity (screenshot comparison,
+"is this the right Elementor widget for this section?") is materially
+better on Opus than smaller models; the agent definitions pin
+`model: opus` in their frontmatter. The deterministic pipeline
+(`import_elementor.py`, `optimize.py`, etc.) does not use an LLM, so
+the cost only applies to the sub-Agent dispatches — typically 3–8 per
+build.
+
+**First-run target:** every `start` must produce the agent's best
+result without a second prompt. The orchestrator's default flow runs
+`--per-section --dom-diff` on the visual review, dispatches Claude
+with the adaptive budget (8 dispatches on first run, 3 on subsequent),
+iterates auto-fix up to 3 rounds, and stops only when the quality
+gate passes. Do NOT defer "review each section" / "match the design"
+work to a second prompt.
+
 The deterministic Python pipeline (`import_elementor.py`) handles asset
 upload, kit globals, structural section finding, widget inference,
 auto-layout inference, and template creation. For sections where it

@@ -62,6 +62,49 @@ def _is_named_color(entry: dict) -> bool:
     return name not in generic
 
 
+def check_responsive_baselines(export_dir: Path) -> list[dict]:
+    """Warn when the export is missing tablet/mobile full-page baselines.
+
+    The visual diff degrades gracefully (skips a breakpoint when its
+    baseline isn't there) but that silently hides mobile regressions —
+    the gate can pass on desktop while mobile is broken. Surface the
+    gap loudly so developers either re-export with the missing
+    breakpoints or accept that the gate is desktop-only.
+    """
+    issues: list[dict] = []
+    if not export_dir.exists():
+        return issues
+    screenshots = export_dir / "screenshots"
+    if not screenshots.exists():
+        return issues
+
+    # The plugin emits these flat in screenshots/ (page.png is desktop).
+    candidates = {
+        "tablet": ["page.tablet.png", "page-tablet.png", "page_tablet.png"],
+        "mobile": ["page.mobile.png", "page-mobile.png", "page_mobile.png"],
+    }
+    missing = []
+    for bp, names in candidates.items():
+        if not any((screenshots / n).exists() for n in names):
+            missing.append(bp)
+
+    if missing:
+        issues.append({
+            "severity": "warn",
+            "kind": "missing-responsive-baselines",
+            "detail": (
+                f"Plugin export is missing {', '.join(missing)} baseline "
+                "screenshot(s) (expected page.tablet.png / page.mobile.png "
+                "in the screenshots/ folder). Visual diff will skip those "
+                "breakpoints, which means the quality gate cannot detect "
+                f"{'/'.join(missing)} regressions. Update the Figma plugin "
+                "to export per-breakpoint screenshots, or accept a "
+                "desktop-only gate."
+            ),
+        })
+    return issues
+
+
 def check_global_json(global_json: dict) -> list[dict]:
     """Return a list of issue dicts. Empty list = pre-flight passes."""
     issues: list[dict] = []
@@ -158,6 +201,8 @@ def run(global_json_path: Path | None = None) -> dict:
 
     global_json = _load(global_json_path)
     issues = check_global_json(global_json)
+    # Same export dir hosts screenshots/ — pull from the global.json parent.
+    issues.extend(check_responsive_baselines(global_json_path.parent))
     passed = not any(i["severity"] == "error" for i in issues)
     return {"passed": passed, "issues": issues, "source": str(global_json_path)}
 

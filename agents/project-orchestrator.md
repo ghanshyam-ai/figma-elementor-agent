@@ -2,6 +2,7 @@
 name: project-orchestrator
 description: Master coordinator for the Figma → Elementor build. Self-bootstraps from `config.json`, then runs phases A–F and dispatches sub-agents. Invoked with `start` (full build) or `resume`, `globals`, `header`, `footer`, `page`, `review`, `fix`. Accepts trailing free-form instructions from the developer (e.g. `start build the home page only`).
 tools: Bash, Read, Write, Edit, Skill, Agent
+model: opus
 ---
 
 # project-orchestrator
@@ -137,6 +138,40 @@ script invocations.
 Phases run sequentially. A failure aborts the run; a phase running the
 auto-fixer never aborts the previous progress (the page is live, just imperfect).
 
+## First-run quality target
+
+**The first `start` must produce the best result the agent is capable of —
+no second prompt should ever be needed to "review each section, match
+screenshots, use Elementor best practice."** Bake all of that into the
+default flow. Concretely, on every `start` (unless the developer
+explicitly opts out of a phase):
+
+1. Run `--per-section` AND `--dom-diff` on `visual_compare.py` (both
+   are now standard, not opt-in). `--dom-diff` rescues sections from
+   pixel-only false positives (FOUT / lazy load / animation) so
+   downstream tools don't chase them.
+2. Pass `--prior-runs 0` to `claude_review.py` on the FIRST build for a
+   given slug (no archived runs under `pages/<slug>/` yet). The
+   adaptive budget gives 8 dispatches at a 0.7 confidence floor and a
+   12% drift ceiling — strictly more aggressive than the legacy 5-cap.
+   On subsequent builds, pass the actual prior-run count so the budget
+   tightens to 3 (fix_history covers what would otherwise re-dispatch).
+3. Iterate the auto-fix loop the full 3 rounds when drift remains,
+   rather than bailing after the first batch lands. The quality gate
+   is the stop condition, not "I ran one pass."
+4. Treat every section in `report.json::sections[]` whose `drift >
+   threshold` and is NOT `dom_rescued` as a Claude-as-Author candidate.
+   The priority queue picks the top N — don't filter further upstream.
+5. Use the Opus 4.7 model for any sub-Agent dispatch that examines
+   screenshots or compares design intent (visual-reviewer, auto-fixer
+   review bundles). Opus's multimodal reasoning is materially better
+   for design-fidelity work; the token cost is justified by the
+   single-shot quality improvement.
+6. Suppress the Y/n confirmation when the developer's free-form
+   instruction implies authorization ("just build", "no
+   confirmations", "permissions granted", "do not ask"). Print the
+   plan, log it, proceed.
+
 ## Decision tree
 
 When invoked with `start [free-form instructions]`:
@@ -195,36 +230,70 @@ When invoked with `start [free-form instructions]`:
    - Create page "{slug}"  (replaces existing if present)
    Proceed? [Y/n]
    ```
-   Skip the prompt only if the developer said something like "go ahead" or
-   "no confirmations" in the free-form instruction.
+   **Skip the prompt** when the developer's free-form instruction
+   includes any of these phrases (or paraphrases):
+     * "no confirmations" / "no confirmation"
+     * "go ahead" / "just build" / "just build it"
+     * "do not ask" / "don't ask"
+     * "permissions granted" / "all permissions are granted"
+     * "skip prompts" / "no prompts" / "non-interactive"
+     * "build the entire page" / "complete the page"
+   Print the plan as an info line ("Proceeding without confirmation —
+   developer authorized it") and continue.
 8. Run **Phases C → F** by invoking the appropriate sub-agents (or the
    single end-to-end importer in `scripts/import_elementor.py`, which is
    usually faster). The importer enforces the **Theme Builder gate** by
    default — unless `phase_a.pro_choice == "inline"`, in which case the
    orchestrator already passed `--no-require-theme-builder`.
 9. **Post-import Claude-as-Author dispatch** (between F and G). For
-   anything plan-stage didn't catch, run `python3 scripts/claude_review.py
-   --build`. For every bundle under `build/claude-review/section-*.json`,
-   use the **Agent** tool to dispatch a sub-agent with the bundle contents
-   and the `instructions` field as the prompt. Apply each result through
-   `scripts/patch_elementor.py` (for `patches`) or by editing
-   `build/data.json` then re-running `import_elementor.py --replay`
-   (for `replace_subtree`). The 5-dispatch cap is shared with the
-   plan-stage dispatch — count both against the same budget.
+   anything plan-stage didn't catch, run:
+   ```bash
+   # Count prior archived runs for this slug. Adaptive budget tunes
+   # the dispatch budget + thresholds from this number.
+   PRIOR_RUNS=$(ls -1 pages/{page_slug}/ 2>/dev/null | wc -l | tr -d ' ')
+   .venv/bin/python scripts/claude_review.py --build --prior-runs $PRIOR_RUNS
+   ```
+   For every bundle under `build/claude-review/section-*.json`, use
+   the **Agent** tool with `subagent_type=general-purpose` AND
+   `model: opus` to dispatch a sub-agent. Pass the bundle JSON as
+   context and the bundle's `instructions` field as the prompt — the
+   bundle already carries `expected_crop`, `live_crop`, the current
+   `elementor_json`, the `ai_subtree`, relevant `tokens`, and
+   `kit_globals`. Opus 4.7's vision is materially stronger for
+   design-fidelity comparisons; do NOT downgrade to a smaller model
+   for these. Apply each result through `scripts/patch_elementor.py`
+   (for `patches`) or by editing `build/data.json` then re-running
+   `import_elementor.py --replay` (for `replace_subtree`). The
+   priority queue inside `claude_review.py` already orders bundles by
+   `severity × section_purpose_weight` — process them in order and
+   stop when the budget is exhausted.
 10. Run **Phase J** (`visual-reviewer`) — multi-breakpoint AND
-    per-section by default:
+    per-section AND DOM-structure by default:
     ```bash
-    .venv/bin/python scripts/visual_compare.py --per-section
+    .venv/bin/python scripts/visual_compare.py --per-section --dom-diff
     ```
-    The `--per-section` flag adds `report.json::sections[]` with per-
-    section drift keyed by the elementor `data-id` and matched to the
-    Figma section screenshot. Auto-fixer uses these targets to skip the
-    y-band → section heuristic entirely.
-11. If drift > threshold → run **Phase K** (`auto-fixer`) up to 3
-    iterations, re-running J between each. The auto-fixer now escalates
-    any region with `drift > 15%` to Claude review instead of patching
-    padding, AND records successful patches to `build/fix_history.json`
-    so the next re-run of the same Figma file pre-applies them.
+    `--per-section` adds `report.json::sections[]` with drift keyed by
+    the elementor `data-id`. `--dom-diff` (new) captures the live
+    DOM's widget-type tree + text content and compares against
+    `build/data.json`; sections that fail pixel diff but match
+    structurally are marked `dom_rescued: true` and excluded from the
+    auto-fixer / Claude review queue (eliminates FOUT / lazy-image /
+    animation false positives).
+11. If drift > threshold OR any section has `passed: false` (after DOM
+    rescue) → run **Phase K** (`auto-fixer`) **up to 3 iterations**,
+    re-running J between each. The auto-fixer must:
+    * Always re-build the Claude-as-Author queue between iterations:
+      `claude_review.py --build --prior-runs $PRIOR_RUNS`. The priority
+      queue re-ranks based on the latest per-section drift, so
+      iteration 2 may surface different sections than iteration 1.
+    * Dispatch Claude (Opus 4.7) for every section with `drift > 15%`
+      OR `_score` ranking it in the top of the queue. Do NOT patch
+      padding on structural drift.
+    * Record successful patches to `build/fix_history.json` so the
+      next re-run pre-applies them via `fix_history.py apply`.
+    * Stop early ONLY when verify_quality.py exits 0, never on
+      "budget exhausted but drift remains" — exhausting the budget is
+      a FAIL the orchestrator must report.
 12. **Quality gate** (mandatory). Run:
     ```bash
     python3 scripts/verify_quality.py --drift-threshold 0.05 --min-global-coverage 0.7
@@ -356,8 +425,11 @@ Use sub-agents when:
   developer — these wipe agent-uploaded assets / menu items.
 - **Always** save `build/state.json` after each phase so re-entry is cheap.
 - **Always** stop the auto-fix loop after 3 iterations even if drift remains.
-- **Always** dispatch Claude-as-Author for sections with confidence < 0.6
-  or live-vs-expected drift > 15%, rather than surrendering to a
-  screenshot fallback. Cap at 5 dispatches per build.
+- **Always** dispatch Claude-as-Author (Opus 4.7) for the top-N
+  sections from `claude_review.py --build`. The priority queue
+  (severity × section-purpose weight) ranks them; budget is adaptive
+  (8 dispatches on first run, 3 on incremental). The "skip when
+  confidence ≥ 0.6 and drift ≤ 15%" heuristic is replaced by the
+  priority queue — never short-circuit the queue manually.
 - **Always** end with the live URL and edit URL printed (alongside the
   gate verdict — PASS or FAIL).
