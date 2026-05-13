@@ -46,6 +46,13 @@ class ReuseGroup:
     template_id: int | None = None
     template_slug: str = ""
     title: str = ""
+    # True when this group's fingerprint matches a template recorded on a
+    # prior page (project_state.component_library). In that case the page's
+    # site(s) get rewritten to shortcodes pointing at `pre_existing_template_id`
+    # — no new template is created on this run.
+    reused_from_state: bool = False
+    pre_existing_template_id: int | None = None
+    pre_existing_page_slug: str = ""
 
     @property
     def section_indices(self) -> list[int]:
@@ -65,7 +72,7 @@ MIN_REUSE_WIDGETS = 2
 MIN_SUBTREE_NODES = 3
 
 
-def detect_reuse_groups(content: list, e: Enrichment) -> list[ReuseGroup]:
+def detect_reuse_groups(content: list, e: Enrichment, state=None) -> list[ReuseGroup]:
     """Find duplicate containers anywhere in the tree (top-level + nested).
 
     Each duplicate group needs to clear two bars before becoming a template:
@@ -73,8 +80,15 @@ def detect_reuse_groups(content: list, e: Enrichment) -> list[ReuseGroup]:
       • the canonical subtree contains >= MIN_REUSE_WIDGETS widgets and
         >= MIN_SUBTREE_NODES total nodes (so we don't template trivial
         single-widget wrappers).
+
+    When ``state`` (a ``ProjectState`` from ``project_state.py``) is provided,
+    a parallel pass also surfaces single-instance containers whose fingerprint
+    already lives in ``state.component_library`` — those get marked
+    ``reused_from_state=True`` and skip the ≥2-instance threshold because
+    the canonical lives on a previously-built page.
     """
     groups_by_fp: dict[str, ReuseGroup] = {}
+    cross_page_groups_by_fp: dict[str, ReuseGroup] = {}
 
     # Phase 1 — collect sites + fingerprints by walking the whole tree.
     for site in _all_container_sites(content):
@@ -92,8 +106,28 @@ def detect_reuse_groups(content: list, e: Enrichment) -> list[ReuseGroup]:
         if not fp:
             fp = _structural_hash(node)
 
+        # Cross-page reuse: does this fingerprint match a template from a
+        # prior page? If so, queue a state-reuse group regardless of how
+        # many local instances exist (a single occurrence is enough to
+        # justify replacing it with a shortcode reference).
+        stored = state.find_component(fp) if state is not None else None
+
         g = groups_by_fp.setdefault(fp, ReuseGroup(fingerprint=str(fp)[:64]))
         g.sites.append(site)
+        if stored:
+            xg = cross_page_groups_by_fp.setdefault(
+                fp,
+                ReuseGroup(
+                    fingerprint=str(fp)[:64],
+                    reused_from_state=True,
+                    pre_existing_template_id=stored.get("template_id"),
+                    pre_existing_page_slug=stored.get("first_page_slug", ""),
+                    template_id=stored.get("template_id"),
+                    template_slug=stored.get("template_slug", "") or _slugify(stored.get("title", "")),
+                    title=stored.get("title", "") or f"Reusable Block {str(fp)[:6]}",
+                ),
+            )
+            xg.sites.append(site)
         if not g.title:
             if depth == 0 and site.index < len(e.section_by_index):
                 sec = e.section_by_index[site.index] or {}
@@ -104,7 +138,22 @@ def detect_reuse_groups(content: list, e: Enrichment) -> list[ReuseGroup]:
 
     # Phase 2 — keep only groups that pass the size + count thresholds.
     out: list[ReuseGroup] = []
-    for g in groups_by_fp.values():
+    # Pass A: cross-page reuse. No ≥2-instance requirement here because the
+    # canonical lives on a prior page. We still apply the size threshold so
+    # we don't shortcode a single-widget wrapper.
+    for fp, g in cross_page_groups_by_fp.items():
+        canonical = g.sites[0]
+        widgets, total = _count_subtree(canonical.node)
+        if widgets < MIN_REUSE_WIDGETS or total < MIN_SUBTREE_NODES:
+            continue
+        g.canonical = canonical
+        out.append(g)
+
+    # Pass B: within-page duplicate detection (unchanged behavior). Skip
+    # fingerprints already handled by Pass A so we don't double-create.
+    for fp, g in groups_by_fp.items():
+        if fp in cross_page_groups_by_fp:
+            continue
         if len(g.sites) < 2:
             continue
         canonical = g.sites[0]
@@ -129,21 +178,21 @@ def replace_duplicates_with_shortcodes(content: list, groups: list[ReuseGroup]) 
     """Swap each non-canonical site for a shortcode reference. Returns count.
 
     Must be called AFTER `template_id` is populated on every group.
+
+    For ``reused_from_state`` groups every site is rewritten — the canonical
+    lives on a prior page, so there's no instance on this page that needs
+    preserving in-tree. For within-page groups (the existing behavior) all
+    sites are also rewritten because the canonical's subtree is already
+    lifted into the library template via ``client.create_template``.
     """
     n = 0
     for g in groups:
         if not g.template_id or not g.canonical:
             continue
-        canonical = g.canonical
         for site in g.sites:
-            # Skip the canonical instance — its tree was lifted into the
-            # library template, but the canonical site itself is also
-            # rewritten so the page renders the shortcode rather than
-            # the inlined original (otherwise we'd ship two copies).
             shortcode_node = _make_template_shortcode(g.template_id, g.title)
             site.parent[site.index] = shortcode_node
             n += 1
-            _ = canonical  # canonical pointer kept for diagnostics
     return n
 
 
@@ -251,12 +300,18 @@ def _make_template_shortcode(template_id: int, title: str) -> dict:
 # Settings that are layout-significant (we hash these). Position offsets
 # and ids are intentionally excluded so structurally-identical sections
 # at different page positions still hash the same.
+#
+# Copy fields (`title`, `text`, `editor`) are intentionally **omitted** so
+# that an accordion-of-FAQs on Home matches an accordion-of-FAQs on About
+# even when the questions differ — that's the whole point of cross-page
+# component reuse. `header_size` and `size` (heading level / icon size) are
+# kept because they're structural choices, not content.
 HASH_SETTINGS_KEYS = (
     "elType", "widgetType", "isInner",
     "flex_direction", "flex_gap", "flex_justify_content", "flex_align_items",
     "flex_wrap", "padding", "min_height", "boxed_width", "content_width",
     "background_background", "background_color", "border_radius",
-    "title", "header_size", "editor", "text", "size",
+    "header_size", "size",
 )
 
 

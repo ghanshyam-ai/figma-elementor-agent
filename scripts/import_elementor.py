@@ -100,6 +100,14 @@ ASSET_REF_RE = re.compile(
 # only signal being a console line a developer might miss.
 ASSET_UPLOAD_FAILURES: list[dict] = []
 
+# Multi-page run reports — populated during the run and merged into
+# build/import-report.json so the orchestrator can read them after.
+CROSS_PAGE_REUSE: dict = {
+    "reused_from_prior_pages": [],   # [{title, template_id, from_page, instances}]
+    "new_components_recorded": [],   # [{title, template_id, fingerprint}]
+}
+GLOBALS_CONFLICT: dict | None = None  # {existing_hash, new_hash} or None
+
 
 def _record_upload_failure(path: Path, exc: Exception) -> None:
     ASSET_UPLOAD_FAILURES.append({
@@ -107,6 +115,31 @@ def _record_upload_failure(path: Path, exc: Exception) -> None:
         "name": path.name,
         "reason": str(exc),
     })
+
+
+def _slugify_basename(name: str) -> str:
+    """Lowercase + collapse non-alnum to dashes. Used for ZIP→slug derive."""
+    import re as _re
+    s = _re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-")
+    return s or ""
+
+
+def _count_subtree_for_state(node: dict) -> tuple[int, int]:
+    """(widget_count, total_node_count) for a subtree — used when recording
+    component_library entries so we know how heavy a reusable block is."""
+    widgets = 0
+    total = 0
+    def walk(n):
+        nonlocal widgets, total
+        if not isinstance(n, dict):
+            return
+        total += 1
+        if n.get("elType") == "widget":
+            widgets += 1
+        for c in n.get("elements") or []:
+            walk(c)
+    walk(node)
+    return widgets, total
 
 
 def _file_sha256(path: Path) -> str:
@@ -926,6 +959,11 @@ def main() -> int:
     ap.add_argument("--page-only", action="store_true",
                     help="Page-by-page mode: skip globals + header/footer + design tokens. "
                          "Use this for the 2nd, 3rd, … page after the home page already created them.")
+    ap.add_argument("--reapply-globals", action="store_true",
+                    help="Force re-applying global.json to the Elementor kit even when the "
+                         "stored tokens_hash already matches a prior run. Without this flag, "
+                         "a divergent global.json prints a warning and the existing kit is kept "
+                         "(safer default — overwriting can break already-built pages).")
     ap.add_argument("--reset-media", action="store_true",
                     help="Before uploading, delete agent-uploaded attachments from prior runs "
                          "(matches by figma-export filename prefix). Destructive — requires --confirm-destructive.")
@@ -963,10 +1001,12 @@ def main() -> int:
 
     # Page-by-page mode: explicit way to say "this is the 2nd / 3rd / Nth
     # page; the home page already created globals + header + footer."
+    # Template reuse stays ON in page-only mode — it's how subsequent pages
+    # pick up accordions / testimonials / etc. that the home page registered
+    # into project_state.component_library (cross-page reuse).
     if args.page_only:
         args.skip_globals = True
         args.skip_header_footer = True
-        args.skip_template_reuse = True  # only run reuse on first run for now
 
     if args.dry_run or args.plan_only:
         # Dry run / plan-only: read config without needing `requests`.
@@ -987,6 +1027,19 @@ def main() -> int:
         cfg["zip_path"] = args.zip_override
     if args.page_slug_override:
         cfg["page_slug"] = args.page_slug_override
+
+    # Auto-derive page_slug from the ZIP filename when the config slug is
+    # the bootstrap default ("home" or missing) AND the ZIP basename
+    # slugifies to something different. Lets `start` work for second + Nth
+    # pages without the dev editing project-config.json each run.
+    if not args.page_slug_override:
+        zip_stem = Path(cfg.get("zip_path", "")).stem
+        derived = _slugify_basename(zip_stem)
+        current = (cfg.get("page_slug") or "").strip()
+        if derived and derived != current and current in ("", "home"):
+            print(f"  page_slug auto-derived from ZIP: '{derived}' (was '{current or '<unset>'}')")
+            cfg["page_slug"] = derived
+
     print(f"→ Target: {cfg['wp_url']}  (theme: {cfg.get('theme_slug', '?')})")
     print(f"  zip:   {cfg['zip_path']}")
     print(f"  slug:  {cfg.get('page_slug', 'home')}")
@@ -1190,12 +1243,36 @@ def main() -> int:
         n_type = len(page_settings.get("system_typography", []))
         n_rad = len(radius_map)
         n_gap = len(gap_map)
-        if args.dry_run:
+        # Globals-conflict guard: if a kit was already applied on a prior
+        # run AND the new global.json hashes differently, skip the POST
+        # unless the dev explicitly passed --reapply-globals. Silently
+        # overwriting brand tokens on page 2 would break page 1's styling.
+        new_tokens_hash, tokens_changed = project_state.record_tokens(global_json)
+        if (
+            tokens_changed
+            and project_state.kit_applied
+            and not args.reapply_globals
+            and not args.dry_run
+        ):
+            global GLOBALS_CONFLICT
+            GLOBALS_CONFLICT = {
+                "existing_hash": project_state.tokens_hash,
+                "new_hash": new_tokens_hash,
+                "existing_kit_id": project_state.kit_id,
+            }
+            print(
+                f"⚠ Globals conflict: new global.json hashes differently to the kit "
+                f"already on this site (kit_id={project_state.kit_id}).\n"
+                f"  Existing kit retained. Pass --reapply-globals to overwrite "
+                f"(may break already-built pages)."
+            )
+        elif args.dry_run:
             print(f"  [dry] would update kit: {n_colors} colors, {n_type} typography, {n_rad} radius tokens, {n_gap} gap tokens")
         else:
             r = client.update_kit_settings(page_settings)
             print(f"✓ Kit {r['kit_id']} updated: {n_colors} colors, {n_type} typography, {n_rad} radius tokens, {n_gap} gap tokens")
             project_state.record_kit_applied(r["kit_id"])
+            project_state.tokens_hash = new_tokens_hash
 
     # --- Per-section screenshot crops -----------------------------------
     # Slice the full-page Figma screenshot into per-section PNGs (using
@@ -1574,12 +1651,31 @@ def main() -> int:
         pass
     elif args.dry_run:
         from template_reuse import detect_reuse_groups
-        for g in detect_reuse_groups(page_only, enrichment):
-            print(f"  [dry] would hoist {len(g.sites)} duplicate(s) of \"{g.title}\" into a section template")
+        for g in detect_reuse_groups(page_only, enrichment, state=project_state):
+            origin = f" (from {g.pre_existing_page_slug})" if g.reused_from_state else ""
+            print(f"  [dry] would hoist {len(g.sites)} duplicate(s) of \"{g.title}\"{origin} into a section template")
     else:
         from template_reuse import detect_reuse_groups, replace_duplicates_with_shortcodes
-        reuse_groups = detect_reuse_groups(page_only, enrichment)
+        reuse_groups = detect_reuse_groups(page_only, enrichment, state=project_state)
         for g in reuse_groups:
+            if g.reused_from_state:
+                # Cross-page reuse: an identical-structure component was
+                # built on a prior page. Skip create_template; we'll just
+                # shortcode-reference the pre-existing template_id.
+                g.template_id = g.pre_existing_template_id
+                CROSS_PAGE_REUSE["reused_from_prior_pages"].append({
+                    "title": g.title,
+                    "template_id": g.template_id,
+                    "from_page": g.pre_existing_page_slug,
+                    "instances": len(g.sites),
+                    "fingerprint": g.fingerprint,
+                })
+                print(
+                    f"✓ Reuse from prior page: \"{g.title}\" "
+                    f"({len(g.sites)} instance(s) on this page) → "
+                    f"template id={g.template_id} (built on '{g.pre_existing_page_slug}')"
+                )
+                continue
             canonical_node = g.canonical.node
             site_slug = (data.get("title") or "site").lower().replace(" ", "-")
             site_slug = "".join(ch for ch in site_slug if ch.isalnum() or ch == "-").strip("-") or "site"
@@ -1599,6 +1695,23 @@ def main() -> int:
                 g.template_id = r.get("id")
                 project_state.record_template(template_slug, "section", r["id"], g.title)
                 print(f"✓ Reuse: {len(g.sites)} instance(s) of \"{g.title}\" → template id={g.template_id}")
+            # Record into the cross-page component library so the *next*
+            # page can shortcode this component without rebuilding it.
+            widget_count, _total = _count_subtree_for_state(g.canonical.node)
+            project_state.record_component(
+                g.fingerprint,
+                g.template_id,
+                slug=template_slug,
+                kind="section",
+                title=g.title,
+                page_slug=cfg.get("page_slug") or "home",
+                widget_count=widget_count,
+            )
+            CROSS_PAGE_REUSE["new_components_recorded"].append({
+                "title": g.title,
+                "template_id": g.template_id,
+                "fingerprint": g.fingerprint,
+            })
         replaced = replace_duplicates_with_shortcodes(page_only, reuse_groups)
         if replaced:
             print(f"  swapped {replaced} instance(s) for shortcode references")
@@ -1780,6 +1893,14 @@ def main() -> int:
         "typography": round(global_coverage["typography"], 3),
         "details": global_coverage.get("details", {}),
     }
+    # Cross-page reuse + globals-conflict summary — orchestrator reads
+    # these to print the "Reused N components from prior pages" block and
+    # to surface a globals-divergence warning at the end of the run.
+    if CROSS_PAGE_REUSE["reused_from_prior_pages"] or CROSS_PAGE_REUSE["new_components_recorded"]:
+        report_dict["cross_page_reuse"] = CROSS_PAGE_REUSE
+    if GLOBALS_CONFLICT is not None:
+        report_dict["globals_conflict"] = GLOBALS_CONFLICT
+
     # Surface asset upload failures so the quality gate can react to them
     # instead of them being a console-only signal that developers miss.
     if ASSET_UPLOAD_FAILURES:

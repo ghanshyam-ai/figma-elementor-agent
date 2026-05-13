@@ -44,8 +44,13 @@ Bash — no separate Python setup script is involved.
    `mu-plugins/` if missing. Skip the copy if the destination already has
    identical bytes.
 4. **Detect the ZIP.** Glob `*.zip` in `<wp_root>/`, then in `<wp_root>/..`,
-   then in this folder. Pick the first match. If none → ask the developer
-   to drop the export `*.zip` in the WP root and stop.
+   then in this folder. If multiple matches AND `project-state.json` exists,
+   prefer ZIPs whose slugified basename (lowercase, non-alnum → `-`) is
+   **not** in `project-state.json::pages_imported[*].slug`. Among the
+   remaining candidates pick the newest by mtime. If every ZIP corresponds
+   to an already-imported page, pick the newest overall and warn the
+   developer that this run will rebuild an existing page. If none →
+   ask the developer to drop the export `*.zip` in the WP root and stop.
 5. **Detect the active theme** (best-effort): scan
    `<wp_root>/wp-content/themes/`, prefer `hello-elementor` if present.
    Fall back to `theme_slug` from `config.json`.
@@ -105,6 +110,54 @@ At the end of any phase, print a one-block summary that includes:
 - what changed on the WordPress side (kit id, page id, template ids, asset ids)
 - the live URL to verify
 - the next phase that will run, if any
+
+## Site-state summary (print before Phase A)
+
+After bootstrap and before Phase A, read `project-state.json` (if present)
+and print a one-screen summary so the developer can see what will be
+skipped on this run. Read it via `cat project-state.json` and synthesize:
+
+```
+Site state ─────────────────────────────────────
+  Prior pages: home, about-us            (from pages_imported[*].slug)
+  Kit applied: yes (kit_id=12)           (kit_applied + kit_id)
+  Tokens hash: f3a8…                     (tokens_hash[:6]; "—" if missing)
+  Header template: yes (id=142)          (template_ids_by_slug, type=header)
+  Footer template: yes (id=143)          (… type=footer)
+  Component library: 8 reusable blocks   (len(component_library))
+  Selected ZIP: about-us.zip → slug "about-us"
+─────────────────────────────────────────────────
+```
+
+Skip the section gracefully (print "Site state: fresh — first run") when
+`project-state.json` is missing. The block is informational; do not block
+the run on missing fields.
+
+## Cross-page reuse summary (print after Phase H)
+
+After Phase H completes, read `build/import-report.json::cross_page_reuse`
+(if present) and print:
+
+```
+Cross-page reuse ────────────────────────────────
+  Reused N components from prior pages:
+    - <title> (from <from_page>, template <template_id>)
+    …
+  Recorded M new reusable components for future pages.
+─────────────────────────────────────────────────
+```
+
+Omit the block entirely when neither array has entries.
+
+If `build/import-report.json::globals_conflict` is set, also print:
+
+```
+⚠ Globals conflict
+  The new global.json hashes differently to the kit already on this site
+  (kit_id=<existing_kit_id>). The existing kit was retained. To overwrite,
+  re-run with `--reapply-globals` (only do this if you accept the change
+  will affect already-built pages).
+```
 
 ## Phase plan
 

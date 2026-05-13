@@ -28,6 +28,33 @@ global settings, build header + footer, and visually verify** the result.
 That's it. The agent handles WP-root detection, bridge install, dep install,
 ZIP detection, the full build, the visual diff, and the auto-fix loop.
 
+## Building additional pages
+
+After Page 1 (typically home) is built, every subsequent page runs through
+the same flow with less work:
+
+1. Export the new page from Figma → ZIP into the WP root (alongside the
+   first one — the agent picks the right one automatically).
+2. Type `start` (no extra args). The orchestrator:
+   - Picks the new ZIP automatically — already-imported ZIPs (those whose
+     slug appears in `project-state.json::pages_imported`) are skipped.
+   - Derives `page_slug` from the ZIP filename (`about-us.zip` → `about-us`).
+   - Skips globals + header/footer (they were created on the first run and
+     live in `project-state.json`).
+   - Reuses prior pages' accordion / testimonial / card-grid components by
+     structural fingerprint — Page 2 won't rebuild a section that's
+     structurally identical to one on Page 1, it shortcodes the existing
+     library template instead.
+3. If the new ZIP carries different brand tokens (a color or font changed
+   between exports), the agent prints a `Globals conflict` warning and
+   **keeps the existing kit**. Re-run with `--reapply-globals` only if
+   you intend to update the kit for *every* already-built page.
+
+`project-state.json` is the source of truth for "what's already on this
+site": kit id, header/footer template ids, asset hashes, component
+library, and the list of imported pages. Don't delete it between page
+builds — that's what makes the second + Nth page fast.
+
 ## Expected layout
 
 Two valid placements — the agent finds WP automatically:

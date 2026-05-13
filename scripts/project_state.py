@@ -14,6 +14,12 @@ non-destructive, we cache:
                                         are skipped when the same image is
                                         referenced from a second page's ZIP)
     • pages_imported                  — slug → page_id audit trail
+    • component_library               — fingerprint → library template, so
+                                        identical accordions / testimonials
+                                        across pages collapse to one source
+    • tokens_hash                     — fingerprint of the applied global.json;
+                                        lets us warn when a later ZIP brings
+                                        different brand colors/typography
 
 Shape: `<repo_root>/project-state.json`. Gitignored (mode 600).
 This file is the orchestrator's "what's already on the WP site". It
@@ -21,6 +27,7 @@ complements `build/state.json`, which is per-run scratch space.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -47,6 +54,14 @@ class ProjectState:
     # SHA-256 of file content skips re-uploads in that case.
     asset_map_by_hash: dict[str, dict] = field(default_factory=dict)
     pages_imported: list[dict] = field(default_factory=list)
+    # Fingerprint → library-template metadata. Lets the next page's reuse
+    # detector short-circuit to a stored template_id instead of recreating
+    # an identical accordion / testimonial / card-grid. Structural-only:
+    # matching ignores copy + image content (see template_reuse._structural_hash).
+    component_library: dict[str, dict] = field(default_factory=dict)
+    # SHA-256 of the canonicalized global.json that was applied to the kit.
+    # Subsequent runs compare against this to warn when brand tokens diverge.
+    tokens_hash: str | None = None
 
     # ---- Convenience properties --------------------------------------
 
@@ -107,6 +122,41 @@ class ProjectState:
             "imported_at": _now_iso(),
         })
 
+    def record_component(
+        self,
+        fingerprint: str,
+        template_id: int,
+        *,
+        slug: str,
+        kind: str,
+        title: str,
+        page_slug: str,
+        widget_count: int = 0,
+    ) -> None:
+        self.component_library[str(fingerprint)] = {
+            "template_id": template_id,
+            "template_slug": slug,
+            "kind": kind,
+            "title": title,
+            "first_page_slug": page_slug,
+            "widget_count": widget_count,
+            "recorded_at": _now_iso(),
+        }
+
+    def find_component(self, fingerprint: str) -> dict | None:
+        return self.component_library.get(str(fingerprint))
+
+    def record_tokens(self, global_dict: dict) -> tuple[str, bool]:
+        """Hash the global.json and report whether it differs from stored.
+
+        Returns ``(new_hash, changed)``. Does **not** persist the new hash —
+        the caller decides whether to keep it (e.g. after a successful kit
+        POST) or leave the stored one alone (warn-and-skip path).
+        """
+        new_hash = _tokens_hash(global_dict)
+        changed = bool(self.tokens_hash) and self.tokens_hash != new_hash
+        return new_hash, changed
+
     def remember_run(self) -> None:
         if not self.first_run_at:
             self.first_run_at = _now_iso()
@@ -120,11 +170,13 @@ class ProjectState:
             "last_run_at": self.last_run_at,
             "kit_applied": self.kit_applied,
             "kit_id": self.kit_id,
+            "tokens_hash": self.tokens_hash,
             "template_ids_by_slug": self.template_ids_by_slug,
             "form_ids_by_title": self.form_ids_by_title,
             "asset_map_by_filename": self.asset_map_by_filename,
             "asset_map_by_hash": self.asset_map_by_hash,
             "pages_imported": self.pages_imported,
+            "component_library": self.component_library,
         }
         self.path.write_text(json.dumps(payload, indent=2, default=str))
         try:
@@ -147,13 +199,21 @@ def load_state(repo_root: Path, filename: str = _DEFAULT_FILENAME) -> ProjectSta
     s.last_run_at = raw.get("last_run_at")
     s.kit_applied = bool(raw.get("kit_applied"))
     s.kit_id = raw.get("kit_id")
+    s.tokens_hash = raw.get("tokens_hash")
     s.template_ids_by_slug = raw.get("template_ids_by_slug") or {}
     s.form_ids_by_title = raw.get("form_ids_by_title") or {}
     s.asset_map_by_filename = raw.get("asset_map_by_filename") or {}
     s.asset_map_by_hash = raw.get("asset_map_by_hash") or {}
     s.pages_imported = raw.get("pages_imported") or []
+    s.component_library = raw.get("component_library") or {}
     return s
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _tokens_hash(global_dict: dict) -> str:
+    """SHA-256 of a canonicalized global.json — order-insensitive."""
+    canon = json.dumps(global_dict or {}, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()

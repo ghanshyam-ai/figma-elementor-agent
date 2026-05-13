@@ -217,19 +217,70 @@ claude
 
 | You type | What runs |
 |----------|-----------|
-| `start` | Full build — globals + header/footer + page + visual diff + DOM diff + a11y + Figma feedback + regression diff. |
-| `start --page-only` | 2nd+ page on the same site — skips globals + theme builder + reuse. |
-| `start --page-only --page-slug about` | Same, with an explicit slug. |
+| `start` | Full build — globals + header/footer + page + visual diff + DOM diff + a11y + Figma feedback + regression diff. Auto-detects whether this is the first page or an additional one. |
+| `start --page-only` | Explicitly run as 2nd+ page on the same site — skips globals + theme builder, **keeps** cross-page component reuse on. (You usually don't need to pass this — `project-state.json` auto-detects.) |
+| `start --page-only --page-slug about` | Same, with an explicit slug override. (Normally `page_slug` is auto-derived from the ZIP filename.) |
+| `start --reapply-globals` | Force-overwrite the Elementor kit even when the new ZIP's `global.json` hashes differently from the one applied on a prior page. Use only when you intend the change to land on every already-built page. |
 | `start no confirmations` | Skip the "Proceed? [Y/n]" prompt. The phrases `just build`, `permissions granted`, `do not ask` all trigger auto-confirm. |
 | `start build only the hero, skip the footer` | Free-form scoping in natural language. |
 | `start inline-only` | Force inline header/footer (skip Theme Builder gate; useful when no Pro). |
-| `start --from-cache` | Skip ZIP extraction + optimization; re-push `build/data.json` to the live page. ~10s instead of ~3 min. |
+| `start --from-cache` | Skip ZIP extraction + optimization; re-push `build/data.json` to the live page. ~10s instead of ~3 min. Useful for resuming after an interruption mid-fix loop. |
 | `start --force` | Overwrite the live page even when WP-side drift is detected (the page was hand-edited in WP admin since the last build). |
 
-The first page on each new site is the **home page** — its ZIP should
-contain header / footer / globals / page content. Subsequent pages
-auto-skip those phases when `project-state.json` shows a prior
-successful run.
+### Building additional pages
+
+After the first page (typically the home page) is built, every
+subsequent page reuses everything already on the site — no manual
+config edits required.
+
+```bash
+# 1. Export the next page from Figma → drop the ZIP in the WP root
+#    (alongside the first one — the agent picks the right one).
+mv ~/Downloads/about-us.zip ~/Local\ Sites/<site-name>/
+
+# 2. Run the same command. That's it.
+cd ~/Local\ Sites/<site-name>/figma-elementor-agent
+claude
+> start
+```
+
+What the orchestrator does differently on the 2nd, 3rd, … page:
+
+| Behavior | Source of truth |
+|----------|-----------------|
+| Picks the **right ZIP automatically** — already-imported ZIPs (slug already present in `project-state.json::pages_imported`) are filtered out. | `agents/project-orchestrator.md` |
+| Derives **`page_slug` from the ZIP filename** — `about-us.zip` → `about-us`. Override with `--page-slug` if needed. | `_slugify_basename()` in `import_elementor.py` |
+| **Skips globals** (kit colors + typography) — already applied on the home run. | `project_state.is_first_run` |
+| **Skips header + footer Theme Builder templates** — already created. | `project_state.template_ids_by_slug` |
+| **Reuses prior pages' components** — accordions, testimonials, card grids, CTA blocks that match structurally are shortcoded to the existing library template instead of being rebuilt. Different copy is OK; matching is structural-only. | `project_state.component_library` + `template_reuse.detect_reuse_groups(state=…)` |
+| **Skips re-uploading** images already on the WP media library (matched by SHA-256). | `project_state.asset_map_by_hash` |
+| **Warns on globals divergence** — if the new ZIP has different brand colors / fonts, prints `Globals conflict`, keeps the existing kit, and writes `globals_conflict` into `build/import-report.json`. Pass `--reapply-globals` to overwrite. | `record_tokens()` |
+
+You'll see a `Site state` summary printed before Phase A and a
+`Cross-page reuse` summary printed after Phase H, so you always know
+which components got reused and which were freshly built.
+
+`project-state.json` is the source of truth for "what's already on
+this site." **Do not delete it between builds** — that's what makes
+the second + Nth page fast.
+
+### Resuming an interrupted build
+
+The agent persists three kinds of state, so most interruptions are
+recoverable without re-running from scratch:
+
+| Scenario | Resume command | Why it works |
+|----------|----------------|--------------|
+| Build was killed after the page was pushed but before the visual-fix loop completed. | `start --from-cache` | Reuses `build/data.json` directly; skips ZIP extraction, optimization, and asset upload. ~10s instead of ~3 min. |
+| Same page, you tweaked Figma + re-exported. | `start` | Standard flow — rerun against the new ZIP. Patches cached in `build/fix_history.json` for this slug auto-apply at the top of the run. |
+| Second page run failed mid-import. | `start` (with the failing page's ZIP in the WP root) | `project-state.json` is only updated on successful save points, so failed runs don't poison it. Re-run picks up cleanly. |
+| You want to nuke everything and start over. | `rm project-state.json build/fix_history.json` then `start` | Forces a fresh "first run" — globals + theme builder will be reapplied; component library is reset. Use only when you really want to rebuild. |
+
+> **What survives between runs vs. what gets wiped:**
+> `build/` is per-run scratch (overwritten every `start`).
+> `pages/<slug>/<ts>/` is the immutable archive of every completed run.
+> `project-state.json` is the cross-run cache — kit id, template ids,
+> asset SHA map, component library, imported-page audit trail.
 
 ### Plan-first workflow (recommended for new designs)
 
@@ -537,7 +588,7 @@ On Windows substitute `.venv\Scripts\python.exe` for `.venv/bin/python`.
 | `build/state.json` | After import | Per-run scratch state — asset map, kit ids, template ids, placements. |
 | `build/data.json` | After import | Rewritten Elementor tree (PRE-regen ids, stamped `_figma_pre_id`). |
 | `build/id_map.json` | After import | pre-regen → post-regen id map built from `_figma_pre_id` markers. |
-| `build/import-report.json` | After import | Confidence + global coverage + asset_failures + a11y_issues + risk areas. |
+| `build/import-report.json` | After import | Confidence + global coverage + asset_failures + a11y_issues + risk areas + (multi-page) `cross_page_reuse` and `globals_conflict`. |
 | `build/wp_drift.json` | Before write | Live-vs-archive node diff. Populated only when the live page was hand-edited in WP admin. |
 | `build/diff/report.json` | After review | Drift per breakpoint + per-section drift + DOM diff result (`dom_rescued` per section). |
 | `build/diff/{live,expected,diff}.png` | After review | Visual diff artifacts. |
@@ -548,7 +599,7 @@ On Windows substitute `.venv\Scripts\python.exe` for `.venv/bin/python`.
 | `build/figma-suggestions.md` | After import | What to fix in Figma to lift the next gate (repeated colors, missing tokens, ambiguous layers). |
 | `build/regression-report.json` | After import | Per-section drift / coverage delta vs the previous archived run. |
 | `pages/<slug>/<ts>/` | After build | Permanent archive — full snapshot of one run (every artifact above + `manifest.json`). |
-| `project-state.json` | Cross-run | Kit id, template ids, form ids, `asset_map_by_filename` + `asset_map_by_hash`, imported pages. |
+| `project-state.json` | Cross-run | Kit id, `tokens_hash` (for globals-conflict detection), template ids, form ids, `asset_map_by_filename` + `asset_map_by_hash`, imported pages, `component_library` (fingerprint → template id, used for cross-page component reuse). |
 
 ---
 
